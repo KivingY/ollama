@@ -43,7 +43,7 @@ def inputs(samples):
             yield color, out.getvalue(), "Name the color of the circle."
 
 
-def verify(call, model, samples):
+def collect_media(call, model, samples):
     gold = json.loads(GOLD.read_text())
     results = {}
     for name, data, prompt in inputs(samples):
@@ -80,6 +80,6 @@ def verify(call, model, samples):
         ), (result, row)
         assert cosine > 0.97, result
         if name in {"blue", "green", "yellow", "black"}:
-            assert name in result["text"].lower(), result
+            result["color_match"] = name in result["text"].lower()
         results[name] = result
     return results

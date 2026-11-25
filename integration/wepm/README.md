@@ -2,9 +2,11 @@
 
 This fork runs WePM 1.0 generation, multimodal embeddings and structured decisions in the same llama-server process. Start by building the CLI and native runner from the same checkout. The build fetches the llama.cpp revision in `LLAMA_CPP_VERSION` and applies the patches in `llama/compat`. A separate llama.cpp fork is unnecessary. See the [development guide](../../docs/development.md).
 
-**Linux development preview.** The released 2B and 4B models pass the core generation, embedding and decision checks on CPU and NVIDIA A100. The 2B Q4_K_M runner loads the vision tower and all 25 language layers onto the A100. Native Windows and macOS deployment still require device validation.
+**Linux development preview.** The released 2B Q4_K_M bundle uses llama.cpp's default CUDA language kernels. The A100 offloads the vision tower and all 25 language layers. The blue- and green-circle fixtures have known quality failures on this configuration. Native Windows and macOS validation is pending.
 
 ## Build on Linux
+
+When upgrading from the first-twelve-block CUDA implementation in `f39bbf4a6`, use fresh CPU and CUDA build directories so CMake fetches and patches a clean llama.cpp tree.
 
 From the repository root, the following builds a CPU distribution. Install the OpenBLAS and libheif development packages before configuring for accelerated task projections and HEIC input. The corresponding shared libraries must be available on the deployment machine.
 
@@ -74,12 +76,10 @@ python integration/wepm/linux_e2e.py dist/bin/ollama dist/lib/ollama \
 
 ## Validation scope
 
-The four release configurations passed 48 core requests on Linux x86-64 CPU and 48 on A100. The GPU runner offloaded 25/25 language layers on both 2B profiles and 33/33 on both 4B profiles. All 16 GPU generation cases gave the expected answer, including 14 exact matches in text and token count. All 12 decisions matched the reference top choice. The minimum cosine across 20 GPU embeddings was 0.99739.
+The Linux harness checks GPU layer placement and runner exit for each model. It writes generation, embedding and decision results to the JSON report. A failed answer is listed under `failed_checks` and causes a nonzero exit after the model checks finish.
 
-### Released 2B Q4_K_M on A100
+On A100, 47 of 48 core cases passed across the four model configurations. All 20 embedding checks and all 12 decision checks passed. The runner offloaded 25/25 language layers for the 2B models and 33/33 for the 4B models.
 
-On the blue-circle fixture, the stock CUDA runner generated `2.0`. Replaying identical official visual embeddings and four-axis positions also changed the first token from ` blue` on CPU to `2` on CUDA. Restoring the CPU output of the first six blocks corrected that replay, but did not correct the replay of the GPU vision tower's output. This motivated validating the entire pipeline for each candidate.
+On the 2B Q4_K_M blue-circle fixture, the official CPU runtime answers `blue` and Ollama on A100 answers `2.0`. With identical input embeddings and positions, an independent PyTorch decoder using the dequantized values from the released Q4 file also ranks `2` first (logit 20.7334), ahead of `Blue` (20.3978). The CLI also answered `2.0`. In the extended media suite, the same blue circle produced `2.0` and the green circle produced `3`. Both color checks remain failures in the report.
 
-The 2B Q4_K_M profile uses 256-element Q8_K activation blocks for Q4_K and Q6_K projections in its first twelve transformer blocks. The CUDA kernel accumulates integer products and applies the stored scales in FP32. The profile keeps the language graph unfused to preserve that arithmetic during prefill and decoding. The block count was selected empirically for this checkpoint. The runner reads the original language GGUF directly. Image decoding, MGVB compression and the embedding and decision heads use the host implementation.
-
-The A100 runner generated ` blue` and identified the second rectangle on the interleaved fixture. It also passed all ten image cases with HEIC photographs, varied image geometry and four circle colors. On six additional synthetic scenes, each with two questions, the release CPU reference and the CUDA runner each identified 11 of 12 colors. Both answered the green-rectangle question in one scene with a number. These are regression results on the listed fixtures. Metal and other GPU architectures need separate qualification.
+On a 40-question [V*Bench sample](https://huggingface.co/datasets/craigwu/vstar_bench/blob/d9ae62c903da0c98336e85c5ee89cd863b04b4da/test_questions.jsonl) (20 direct attributes and 20 relative positions), the default CUDA runner answered 33 correctly. After a fresh load on the same A100, all 40 responses repeated. The released Transformers BF16 model answered 32 correctly. These measurements cover greedy generation on this sample.

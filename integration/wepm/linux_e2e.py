@@ -180,7 +180,6 @@ def test_lifecycle(call, host, name, binary, env, expected, pid):
     output["cli_decision"] = result["answers"]
     fixture = HERE / "fixtures/shape-0.png"
     output["cli_image"] = cli("Name the color of the circle.", str(fixture))
-    assert "blue" in output["cli_image"].lower(), output["cli_image"]
     output["cli_choice"] = cli(
         "--ask",
         "Which color?",
@@ -369,6 +368,7 @@ def main():
                     except OSError:
                         time.sleep(0.1)
                 report = {}
+                failures = []
                 for label in args.models:
                     size, q = label.split("-")
                     name = "wepm-" + label.lower()
@@ -404,11 +404,11 @@ def main():
                     if args.media_only:
                         if label != "2B-q4":
                             raise ValueError("extended image goldens use 2B-q4")
-                        from ollama_media import verify
+                        from ollama_media import collect_media
 
                         if not args.sample_images:
                             parser.error("--media-only requires --sample-images")
-                        media_checks = verify(call, name, args.sample_images)
+                        media_checks = collect_media(call, name, args.sample_images)
                         rows = []
                     else:
                         rows = validate(call, name, gold)
@@ -495,7 +495,9 @@ def main():
                             raise AssertionError(
                                 f"{label}: expected all vision operators on CUDA"
                             )
-                        report[label]["vision_backend"] = vision.group(1).decode("ascii")
+                        report[label]["vision_backend"] = vision.group(1).decode(
+                            "ascii"
+                        )
                         layers = re.search(
                             rb"offloaded (\d+)/(\d+) layers to GPU", run_log
                         )
@@ -504,7 +506,6 @@ def main():
                             int(x) for x in layers.groups()
                         ]
                     assert runner_pids(proc.pid) == pids
-                    check_rows(rows, args.device == "cpu")
                     call("/api/generate", model=name, keep_alive=0)
                     for _ in range(200):
                         if (
@@ -539,8 +540,33 @@ def main():
                                 f"{label}: expected full GPU language offload, observed {offloaded}/{total} layers"
                             )
                         report[label]["validated_placement"] = "full GPU language"
+                    # Preserve the placement and unload evidence even when a quality fixture fails.
+                    failed = []
+                    for row in rows:
+                        try:
+                            check_rows([row], args.device == "cpu")
+                        except AssertionError:
+                            failed.append(f"{row['case']}/{row['task']}")
+                    if (
+                        "lifecycle" in report[label]
+                        and "blue"
+                        not in report[label]["lifecycle"]["cli_image"].lower()
+                    ):
+                        failed.append("cli/blue-circle")
+                    if args.media_only:
+                        failed.extend(
+                            f"media/{key}"
+                            for key, result in media_checks.items()
+                            if result.get("color_match") is False
+                        )
+                    report[label]["failed_checks"] = failed
+                    failures.extend(f"{label} {case}" for case in failed)
                     args.output.write_text(
                         json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+                    )
+                if failures:
+                    raise AssertionError(
+                        f"Failed checks in {args.output}: {', '.join(failures)}"
                     )
             finally:
                 try:
