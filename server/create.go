@@ -703,6 +703,18 @@ func convertModelFromFilesWithMediaType(ctx context.Context, files map[string]st
 			return nil, err
 		}
 
+		for _, layer := range allLayers {
+			if layer.GGUF != nil && layer.GGUF.Bool("wepm.task_heads") {
+				width := layer.GGUF.Uint("vision.projection_dim")
+				valid := slices.ContainsFunc(allLayers, func(lang *modelLayer) bool {
+					return lang.GGUF != nil && lang.GGUF.Architecture() == "qwen35" && lang.GGUF.Uint("embedding_length") == width
+				})
+				if !valid {
+					return nil, errors.New("WePM projector requires a matching Qwen3.5 language GGUF")
+				}
+			}
+		}
+
 		if detectTemplate {
 			return detectChatTemplate(allLayers)
 		}
@@ -1095,6 +1107,14 @@ func ggufLayersWithMediaType(digest, sourceName, mediaType string, fn func(resp 
 		return nil, err
 	}
 
+	if metadata.Architecture() == "unimodel_aux" {
+		fn(api.ProgressResponse{Status: "importing WePM vision and task heads"})
+		layer, err := importWePMProjector(blobPath)
+		if err != nil {
+			return nil, err
+		}
+		return ggufLayersWithMediaType(layer.Digest, sourceName, layer.MediaType, fn)
+	}
 	if metadata.Kind() == "adapter" {
 		return nil, fmt.Errorf("%w: %s is a LoRA adapter", errAdaptersUnsupported, sourceName)
 	}

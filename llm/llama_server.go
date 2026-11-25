@@ -2444,18 +2444,26 @@ func llamaServerChatMessage(msg Message) (map[string]any, error) {
 	}
 
 	parts := make([]map[string]any, 0, len(msg.Media)+1)
-	if msg.Content != "" {
-		parts = append(parts, map[string]any{
-			"type": "text",
-			"text": msg.Content,
-		})
-	}
-	for _, media := range msg.Media {
+	remaining := msg.Content
+	for i, media := range msg.Media {
+		marker := fmt.Sprintf("[img-%d]", i)
+		before, after, found := strings.Cut(remaining, marker)
+		if !found {
+			before = remaining
+			after = ""
+		}
+		if before != "" {
+			parts = append(parts, map[string]any{"type": "text", "text": before})
+		}
 		part, err := llamaServerChatMediaPart(media)
 		if err != nil {
 			return nil, err
 		}
 		parts = append(parts, part)
+		remaining = after
+	}
+	if remaining != "" {
+		parts = append(parts, map[string]any{"type": "text", "text": remaining})
 	}
 	converted["content"] = parts
 	return converted, nil
@@ -2476,7 +2484,7 @@ func llamaServerChatMediaPart(media MediaData) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	mime := http.DetectContentType(data)
+	mime := api.ImageData(data).ContentType()
 	if !strings.HasPrefix(mime, "image/") {
 		mime = "image/jpeg"
 	}
@@ -2554,17 +2562,34 @@ func llamaServerChatResponseFormat(format json.RawMessage) (map[string]any, erro
 }
 
 func (s *llamaServerRunner) Embedding(ctx context.Context, input string, media [][]byte) ([]float32, int, error) {
+	return s.embedding(ctx, input, media, nil, nil)
+}
+
+func (s *llamaServerRunner) EmbeddingParts(ctx context.Context, text []string, media [][]byte, truncate bool) ([]float32, int, error) {
+	if len(text) != len(media)+1 {
+		return nil, 0, errors.New("invalid ordered embedding input")
+	}
+	return s.embedding(ctx, "", media, text, &truncate)
+}
+
+func (s *llamaServerRunner) embedding(ctx context.Context, input string, media [][]byte, parts []string, truncate *bool) ([]float32, int, error) {
 	if err := s.sem.Acquire(ctx, 1); err != nil {
 		return nil, 0, err
 	}
 	defer s.sem.Release(1)
 
+	if parts != nil {
+		input = strings.Join(parts, s.llamaServerMediaMarker())
+	}
 	var prompt any = input
 	if len(media) > 0 {
 		if len(s.launch.projectors) == 0 {
 			return nil, 0, api.StatusError{StatusCode: http.StatusNotImplemented, ErrorMessage: "model does not support media embeddings"}
 		}
-		multimodal := llamaServerMultimodalPrompt{PromptString: input + strings.Repeat(s.llamaServerMediaMarker(), len(media))}
+		if parts == nil {
+			input += strings.Repeat(s.llamaServerMediaMarker(), len(media))
+		}
+		multimodal := llamaServerMultimodalPrompt{PromptString: input}
 		for _, m := range media {
 			data, err := llamaServerMediaBytes(m)
 			if err != nil {
@@ -2585,6 +2610,9 @@ func (s *llamaServerRunner) Embedding(ctx context.Context, input string, media [
 	// Use "input" field (not "content") to get the OAI-compatible response format
 	// which includes tokens_evaluated for prompt token counting
 	req := map[string]any{"input": prompt}
+	if truncate != nil {
+		req["truncate"] = *truncate
+	}
 	if s.rawEmbeddings {
 		req["embd_normalize"] = -1
 	}

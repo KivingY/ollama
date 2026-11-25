@@ -135,6 +135,28 @@ func decide(cmd *cobra.Command, opts runOptions, input api.Message, questions *a
 			state = json.RawMessage(s)
 		}
 	}
+	if opts.WePM {
+		if questions.Len() != 1 {
+			return errors.New("WePM expects one --ask question")
+		}
+		for _, q := range questions.All() {
+			if q.Type == "choice" {
+				var choices orderedmap.Map[string, any]
+				if err := json.Unmarshal(q.Criteria, &choices); err != nil {
+					return err
+				}
+				for label, desc := range choices.All() {
+					if desc == nil {
+						choices.Set(label, label)
+					}
+				}
+				q.Criteria, _ = json.Marshal(&choices)
+			}
+			questions = &api.SystemOneQuestions{}
+			questions.Set("q", q)
+			break
+		}
+	}
 	req := &api.SystemOneRequest{
 		Model:     opts.Model,
 		Runner:    opts.Runner,

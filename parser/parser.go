@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -256,35 +257,50 @@ func fileDigestMap(path string) (map[string]string, error) {
 		return nil, err
 	}
 
-	var files []string
-	if fi.IsDir() {
-		fs, err := filesForModel(path)
+	dir, language := path, ""
+	if !fi.IsDir() {
+		dir, language = filepath.Dir(path), filepath.Base(path)
+	}
+	var expected map[string]string
+	if fi.IsDir() || language == "language-Q4_K_M.gguf" || language == "language-BF16.gguf" {
+		expected, err = wepmBundle(dir, language)
 		if err != nil {
 			return nil, err
 		}
-
-		for _, f := range fs {
-			f, err := filepath.EvalSymlinks(f)
+	}
+	var files []string
+	if expected != nil {
+		for filename := range expected {
+			files = append(files, filepath.Join(dir, filename))
+		}
+	} else if fi.IsDir() {
+		files, err = filesForModel(path)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		files = []string{path}
+	}
+	if fi.IsDir() || expected != nil {
+		for i, f := range files {
+			resolved, err := filepath.EvalSymlinks(f)
 			if err != nil {
 				return nil, err
 			}
-
-			rel, err := filepath.Rel(path, f)
+			rel, err := filepath.Rel(dir, resolved)
 			if err != nil {
 				return nil, err
 			}
-
 			if !filepath.IsLocal(rel) {
 				if strings.Contains(rel, ".cache") {
 					return nil, fmt.Errorf("insecure path: %s\n\nUse --local-dir <dir> when downloading model to disable caching", rel)
 				}
 				return nil, fmt.Errorf("insecure path: %s", rel)
 			}
-
-			files = append(files, f)
+			if expected == nil {
+				files[i] = resolved
+			}
 		}
-	} else {
-		files = []string{path}
 	}
 
 	var mu sync.Mutex
@@ -297,6 +313,9 @@ func fileDigestMap(path string) (map[string]string, error) {
 				return err
 			}
 
+			if expected != nil && expected[filepath.Base(f)] != digest {
+				return fmt.Errorf("digest mismatch for WePM bundle file %s", filepath.Base(f))
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			fl[f] = digest
@@ -328,6 +347,41 @@ func digestForFile(filename string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
+}
+
+func wepmBundle(dir, language string) (map[string]string, error) {
+	b, err := os.ReadFile(filepath.Join(dir, "bundle.json"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var release struct {
+		Format, Architecture string
+		Files                map[string]struct{ SHA256 string }
+	}
+	if json.Unmarshal(b, &release) != nil || release.Format != "wepm-gguf-release-v1" {
+		return nil, nil
+	}
+	if release.Architecture != "task_slots_v1" {
+		return nil, fmt.Errorf("unsupported WePM architecture %q", release.Architecture)
+	}
+	if language == "" {
+		language = "language-Q4_K_M.gguf"
+		if _, ok := release.Files[language]; !ok {
+			language = "language-BF16.gguf"
+		}
+	}
+	expected := map[string]string{}
+	for _, name := range []string{language, "multimodal-BF16.gguf"} {
+		hash := release.Files[name].SHA256
+		if len(hash) != sha256.Size*2 {
+			return nil, fmt.Errorf("missing SHA256 for %s", name)
+		}
+		expected[name] = "sha256:" + hash
+	}
+	return expected, nil
 }
 
 func filesForModel(path string) ([]string, error) {

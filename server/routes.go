@@ -173,7 +173,7 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 }
 
 func shouldApplyEmbeddingBatchDefault(m *Model, requestOpts map[string]any) bool {
-	if m == nil || hasOption(m.Options, "num_batch") || hasOption(requestOpts, "num_batch") {
+	if m == nil || m.hasWePMProjector() || hasOption(m.Options, "num_batch") || hasOption(requestOpts, "num_batch") {
 		return false
 	}
 	if slices.Contains(m.Config.Capabilities, string(model.CapabilityEmbedding)) {
@@ -898,6 +898,9 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 func (s *Server) systemOneLlamaServer(c *gin.Context, m *Model, req decision.Request, body []byte) {
 	decisionType := m.metadata.String("decision.type")
+	if m.hasWePMProjector() {
+		decisionType = "wepm"
+	}
 	// Old Clef GGUFs have a decision type but use qwen35; llama.cpp now
 	// requires the clef architecture and its converted decision head.
 	oldClef := decisionType == "clef" && m.metadata.String("general.architecture") == "qwen35"
@@ -1133,6 +1136,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 	// text embed path; items with media go through the runner's media-aware
 	// embed.
 	type embedInput struct {
+		parts []string
 		text  string
 		media [][]byte
 	}
@@ -1145,6 +1149,34 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 	// yet, so it's a hard error rather than silently ignored.
 	parseMultimodalItem := func(m map[string]any) (embedInput, error) {
 		var item embedInput
+		if raw, ok := m["content"]; ok {
+			parts, ok := raw.([]any)
+			if !ok || len(parts) == 0 || len(m) != 1 {
+				return item, errors.New("input.content must be a nonempty list")
+			}
+			item.parts = []string{""}
+			for _, value := range parts {
+				part, ok := value.(map[string]any)
+				if !ok || len(part) != 1 {
+					return item, errors.New("expected a text or image part")
+				}
+				if text, ok := part["text"].(string); ok {
+					item.parts[len(item.parts)-1] += text
+					continue
+				}
+				image, ok := part["image"].(string)
+				if !ok {
+					return item, errors.New("expected base64 image")
+				}
+				data, err := base64.StdEncoding.DecodeString(image)
+				if err != nil {
+					return item, err
+				}
+				item.media = append(item.media, data)
+				item.parts = append(item.parts, "")
+			}
+			return item, nil
+		}
 		for key, v := range m {
 			str, ok := v.(string)
 			if !ok {
@@ -1217,6 +1249,10 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
+	if m.hasWePMProjector() && req.Dimensions != 0 && (req.Dimensions < 64 || req.Dimensions > 2048 || req.Dimensions&(req.Dimensions-1) != 0) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "WePM supports dimensions 64, 128, 256, 512, 1024, and 2048"})
+		return
+	}
 	r, m, opts, err := s.scheduleRunnerForModel(c.Request.Context(), m, []model.Capability{}, req.Options, req.KeepAlive, nil)
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
@@ -1290,6 +1326,19 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 	}
 
 	embedWithRetry := func(item embedInput) ([]float32, int, error) {
+		if item.parts != nil || m.hasWePMProjector() {
+			if item.parts == nil {
+				item.parts = make([]string, len(item.media)+1)
+				item.parts[0] = item.text
+			}
+			runner, ok := r.(interface {
+				EmbeddingParts(context.Context, []string, [][]byte, bool) ([]float32, int, error)
+			})
+			if !ok {
+				return nil, 0, api.StatusError{StatusCode: http.StatusBadRequest, ErrorMessage: "runner does not support ordered embedding content"}
+			}
+			return runner.EmbeddingParts(ctx, item.parts, item.media, req.Truncate == nil || *req.Truncate)
+		}
 		text := item.text
 		if req.Truncate != nil && !*req.Truncate {
 			tokens, ctxLen, err := inputTokensAndContext(text)
@@ -3278,6 +3327,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		return
 	}
 
+	if m.hasWePMProjector() {
+		req.Messages = middleware.OrderedChatMessages(c, req.Messages)
+	}
 	msgs := chatMessagesForRequest(m, req.Messages)
 
 	parserName := parserNameForModel(m)

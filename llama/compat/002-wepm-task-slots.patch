@@ -1,0 +1,1701 @@
+diff --git a/conversion/qwen3vl.py b/conversion/qwen3vl.py
+index c15959b..a50402f 100644
+--- a/conversion/qwen3vl.py
++++ b/conversion/qwen3vl.py
+@@ -46,6 +46,8 @@ class Qwen3VLVisionModel(MmprojModel):
+         # in case mixed modalities, the arch will be handled by subclass
+         if not self.has_audio_encoder:
+             self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN3VL)
++            if self.global_config.get("unimodel_architecture") == "task_slots_v1":
++                self.gguf_writer.add_bool("clip.vision.wepm_task_slots_v1", True)
+         self.gguf_writer.add_vision_use_gelu(True)
+ 
+         if self.hparams_vision is not None:
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index f984f13..6f783e5 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -2079,14 +2079,22 @@ static void ggml_compute_forward_gelu_f32(
+     const int ir0 = dr*ith;
+     const int ir1 = MIN(ir0 + dr, nr);
+ 
++    const bool use_f32 = ggml_prec_get_src(dst, 0) == GGML_PREC_F32;
++
+     for (int ir = ir0; ir < ir1; ++ir) {
+         const int i3 = ir/(ne02*ne01);
+         const int i2 = (ir - i3*ne02*ne01)/ne01;
+         const int i1 = (ir - i3*ne02*ne01 - i2*ne01);
+ 
+-        ggml_vec_gelu_f32(nc,
+-                (float *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1),
+-                (float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01));
++        float * y = (float *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*nb1);
++        const float * x = (const float *) ((const char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01);
++        if (use_f32) {
++            for (int k = 0; k < nc; ++k) {
++                y[k] = ggml_gelu_f32(x[k]);
++            }
++        } else {
++            ggml_vec_gelu_f32(nc, y, x);
++        }
+ 
+ #ifndef NDEBUG
+         for (int k = 0; k < nc; k++) {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 3389dcd..19d5fde 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -3324,6 +3324,13 @@ bool ggml_prec_set_src(
+     GGML_ASSERT(idx >= 0 && idx < GGML_MAX_SRC);
+ 
+     switch (a->op) {
++        case GGML_OP_UNARY:
++            if (ggml_get_unary_op(a) != GGML_UNARY_OP_GELU || idx != 0 || a->src[0]->type != GGML_TYPE_F32 ||
++                (prec != GGML_PREC_F32 && prec != GGML_PREC_UNDEFINED)) {
++                return false;
++            }
++            ggml_set_op_params_i32(a, 1, (int32_t) prec);
++            break;
+         case GGML_OP_MUL_MAT:
+         case GGML_OP_MUL_MAT_ID:
+             {
+@@ -3361,6 +3368,11 @@ enum ggml_prec ggml_prec_get_src(
+     GGML_ASSERT(idx >= 0 && idx < GGML_MAX_SRC);
+ 
+     switch (a->op) {
++        case GGML_OP_UNARY:
++            if (ggml_get_unary_op(a) == GGML_UNARY_OP_GELU && idx == 0 && a->src[0]->type == GGML_TYPE_F32) {
++                return (enum ggml_prec) ggml_get_op_params_i32(a, 1);
++            }
++            return GGML_PREC_UNDEFINED;
+         case GGML_OP_MUL_MAT:
+         case GGML_OP_MUL_MAT_ID:
+             if (idx != 1) {
+diff --git a/tools/mtmd/models/qwen3vl.cpp b/tools/mtmd/models/qwen3vl.cpp
+index ada7a12..d10ac1f 100644
+--- a/tools/mtmd/models/qwen3vl.cpp
++++ b/tools/mtmd/models/qwen3vl.cpp
+@@ -169,11 +169,12 @@ ggml_cgraph * mtmd_graph_qwen3vl::build() {
+     ggml_tensor * embeddings = inpL;
+     embeddings = ggml_reshape_3d(ctx0, embeddings, n_embd * 4, n_pos / 4, batch_size);
+ 
++    // WePM uses nn.GELU() in the merger and tanh GELU in the tower.
+     embeddings = build_ffn(embeddings,
+         model.mm_0_w, model.mm_0_b,
+         nullptr, nullptr,
+         model.mm_1_w, model.mm_1_b,
+-        ffn_op_type::FFN_GELU, -1);
++        hparams.wepm_task_slots_v1 ? FFN_GELU_ERF : FFN_GELU, -1);
+ 
+     if (deepstack_features) {
+         embeddings = ggml_concat(ctx0, embeddings, deepstack_features, 0);
+diff --git a/tools/mtmd/mtmd-graph.cpp b/tools/mtmd/mtmd-graph.cpp
+index a22f41d..2ab8d4a 100644
+--- a/tools/mtmd/mtmd-graph.cpp
++++ b/tools/mtmd/mtmd-graph.cpp
+@@ -470,6 +470,10 @@ ggml_tensor * mtmd_graph::build_ffn(
+                 cb(cur, "ffn_geglu", il);
+             } else {
+                 cur = ggml_gelu(ctx0, cur);
++                if (hparams.wepm_task_slots_v1) {
++                    // FP16 table lookup can change the first greedy token on WePM Q4.
++                    GGML_ASSERT(ggml_prec_set_src(cur, GGML_PREC_F32, 0));
++                }
+                 cb(cur, "ffn_gelu", il);
+             } break;
+         case FFN_GELU_ERF:
+diff --git a/tools/mtmd/mtmd-image.cpp b/tools/mtmd/mtmd-image.cpp
+index c69930f..d1cd4f6 100644
+--- a/tools/mtmd/mtmd-image.cpp
++++ b/tools/mtmd/mtmd-image.cpp
+@@ -808,6 +808,24 @@ mtmd_image_size mtmd_image_preprocessor_dyn_size::get_target_size(const mtmd_hpa
+ }
+ 
+ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const mtmd_image_u8 & img) const {
++    if (hparams.wepm_task_slots_v1) {
++        // Apply the published PIL preprocessing before the Qwen processor grid.
++        const auto size=img.get_size();
++        const double scale=std::min(1.0,1500.0/std::max(size.width,size.height));
++        const int w=std::max(1,int(std::nearbyint(size.width*scale)));
++        const int h=std::max(1,int(std::nearbyint(size.height*scale)));
++        const mtmd_image_size padded_size{std::max(w,(h+199)/200),std::max(h,(w+199)/200)};
++        mtmd_image_u8 scaled,padded,resized;
++        const mtmd_image_u8 * source=&img;
++        if(w!=size.width||h!=size.height){img_tool::resize(img,scaled,{w,h},RESIZE_ALGO_BICUBIC,PAD_NONE);source=&scaled;}
++        if(!(padded_size==source->get_size())){
++            padded.set_size(padded_size,source->is_placeholder());
++            img_tool::fill(padded,{255,255,255});img_tool::composite(padded,*source,0,0);source=&padded;
++        }
++        const auto target=mtmd_image_preprocessor_qwen3vl::smart_resize(padded_size.width,padded_size.height,hparams.patch_size*hparams.n_merge,65536,2250000);
++        img_tool::resize(*source,resized,target,RESIZE_ALGO_BICUBIC,PAD_NONE);
++        mtmd_image_preproc_out out;out.append(hparams,resized,true);return out;
++    }
+     mtmd_image_u8 resized_image;
+     img_tool::resize(img, resized_image, target_size(img.get_size()),
+                         hparams.image_resize_algo,
+diff --git a/tools/mtmd/mtmd-impl.h b/tools/mtmd/mtmd-impl.h
+index 12bc972..9e9eeef 100644
+--- a/tools/mtmd/mtmd-impl.h
++++ b/tools/mtmd/mtmd-impl.h
+@@ -36,6 +36,7 @@
+ #define KEY_HAS_AUDIO_ENC       "clip.has_audio_encoder"
+ #define KEY_HAS_VISION_ENC      "clip.has_vision_encoder"
+ #define KEY_HAS_GEN_AUDIO_ENC   "clip.has_gen_audio_encoder"
++#define KEY_WEPM_TASK_SLOTS_V1  "clip.vision.wepm_task_slots_v1"
+ #define KEY_USE_GELU            "clip.use_gelu"
+ #define KEY_USE_SILU            "clip.use_silu"
+ 
+diff --git a/tools/mtmd/mtmd-model.cpp b/tools/mtmd/mtmd-model.cpp
+index 97dc475..e11c5dd 100644
+--- a/tools/mtmd/mtmd-model.cpp
++++ b/tools/mtmd/mtmd-model.cpp
+@@ -658,6 +658,9 @@ struct mtmd_model_loader {
+                 case PROJECTOR_TYPE_QWEN3VL:
+                 case PROJECTOR_TYPE_LING3VL:
+                     {
++                        if (model.proj_type == PROJECTOR_TYPE_QWEN3VL) {
++                            get_bool(KEY_WEPM_TASK_SLOTS_V1, hparams.wepm_task_slots_v1, false);
++                        }
+                         hparams.n_merge = 2; // default value for Qwen 2 and 2.5
+                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                         hparams.image_resize_pad  = PAD_NONE; // the HF processor resizes to the smart_resize size, no padding
+diff --git a/tools/mtmd/mtmd-model.h b/tools/mtmd/mtmd-model.h
+index 10c3154..8f15c25 100644
+--- a/tools/mtmd/mtmd-model.h
++++ b/tools/mtmd/mtmd-model.h
+@@ -115,6 +115,7 @@ struct mtmd_hparams {
+     int32_t warmup_audio_size = 3000;
+ 
+     ffn_op_type ffn_op = FFN_GELU;
++    bool wepm_task_slots_v1 = false;
+ 
+     patch_merge_type mm_patch_merge_type = PATCH_MERGE_FLAT;
+ 
+diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
+index 9f9393f..c8a7468 100644
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -39,6 +39,25 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
+ target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
+ target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+ target_link_libraries(${TARGET} PRIVATE vendor::hash)
++find_path(WEPM_HEIF_INCLUDE libheif/heif.h)
++find_library(WEPM_HEIF_LIBRARY NAMES heif)
++if (WEPM_HEIF_INCLUDE AND WEPM_HEIF_LIBRARY)
++    target_compile_definitions(${TARGET} PRIVATE WEPM_USE_HEIF)
++    target_include_directories(${TARGET} PRIVATE ${WEPM_HEIF_INCLUDE})
++    target_link_libraries(${TARGET} PRIVATE ${WEPM_HEIF_LIBRARY})
++endif()
++if (APPLE)
++    target_compile_definitions(${TARGET} PRIVATE WEPM_USE_ACCELERATE)
++    target_link_libraries(${TARGET} PRIVATE "-framework Accelerate")
++else()
++    find_library(WEPM_BLAS NAMES openblas)
++    find_path(WEPM_CBLAS_INCLUDE cblas.h)
++    if (WEPM_BLAS AND WEPM_CBLAS_INCLUDE)
++        target_compile_definitions(${TARGET} PRIVATE WEPM_USE_CBLAS)
++        target_include_directories(${TARGET} PRIVATE ${WEPM_CBLAS_INCLUDE})
++        target_link_libraries(${TARGET} PRIVATE ${WEPM_BLAS})
++    endif()
++endif()
+ 
+ # llama-server-impl: server logic, reusable by app
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 89f884e..7789aef 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,39 +1,39 @@
+ #include "server-context.h"
+-#include <atomic>
+-#include <thread>
++
+ #include "base64.hpp"
++#include "build-info.h"
++#include "common.h"
++#include "fit.h"
++#include "llama.h"
++#include "log.h"
++#include "mtmd-helper.h"
++#include "mtmd.h"
++#include "sampling.h"
+ #include "server-chat.h"
+ #include "server-common.h"
+ #include "server-decision.h"
+ #include "server-http.h"
+-#include "server-task.h"
+ #include "server-queue.h"
+ #include "server-realtime.h"
+ #include "server-schema.h"
+ #include "server-slot-sched.h"
+ #include "server-stream.h"
+-
+-#include "build-info.h"
+-#include "common.h"
+-#include "fit.h"
+-#include "llama.h"
+-#include "log.h"
+-#include "sampling.h"
++#include "server-task.h"
+ #include "speculative.h"
+-#include "mtmd.h"
+-#include "mtmd-helper.h"
+-#include "base64.hpp"
++#include "wepm/engine.hpp"
+ 
+ #include <algorithm>
+-#include <cstddef>
++#include <atomic>
+ #include <cinttypes>
++#include <cstddef>
+ #include <deque>
+ #include <exception>
+-#include <memory>
+ #include <filesystem>
++#include <fstream>
++#include <memory>
+ #include <random>
++#include <thread>
+ #include <utility>
+-#include <fstream>
+ 
+ // fix problem with std::min and std::max
+ #if defined(_WIN32)
+@@ -1042,6 +1042,7 @@ public:
+     llama_model * model_tgt = nullptr;
+ 
+     mtmd_context * mctx = nullptr;
++    std::unique_ptr<wepm::Engine> wepm_engine;
+     mtmd_helper_cap mtmd_cap = {};
+     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
+     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
+@@ -1154,6 +1155,7 @@ private:
+     int64_t t_last_load_progress_ms = 0;
+ 
+     void destroy() {
++        wepm_engine.reset();
+         spec.reset();
+         spec_init.reset();
+ 
+@@ -1234,6 +1236,20 @@ private:
+         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+ 
+         const bool has_mmproj = !params.mmproj.path.empty();
++        const bool wepm_profile = has_mmproj && wepm::TensorFile(params.mmproj.path).has_wepm_vision_profile();
++        if (wepm_profile) {
++            params_base.n_outputs_max = params_base.n_batch;
++            params_base.pooling_type  = LLAMA_POOLING_TYPE_NONE;
++            if (wepm::TensorFile(params.model.path).needs_reference_language_backend()) {
++                // The released 2B Q4 task-slot model is sensitive to GPU language
++                // prefill arithmetic. Keep the quantized language path on CPU
++                // and independently offload the vision tower via mtmd.
++                params_base.n_gpu_layers  = 0;
++                params_base.no_kv_offload = true;
++                params_base.no_op_offload = true;
++                SRV_INF("%s", "WePM 2B Q4_K_M: using reference CPU language kernels and configured vision device\n");
++            }
++        }
+         const bool has_draft = params.speculative.has_dft();
+         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                         params_base.speculative.types.end(),
+@@ -1410,6 +1426,10 @@ private:
+                 }
+             }
+ 
++            if (wepm_profile) {
++                mparams.image_min_tokens = 64;
++                mparams.image_max_tokens = 2197;
++            }
+             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+             if (mctx == nullptr) {
+                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+@@ -1417,6 +1437,16 @@ private:
+             }
+             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+ 
++            if (wepm_profile) {
++                try {
++                    wepm_engine =
++                        std::make_unique<wepm::Engine>(params_base.model.path, mmproj_path, ctx_tgt, mctx, model_tgt);
++                } catch (const std::exception & e) {
++                    SRV_ERR("invalid WePM task heads: %s\n", e.what());
++                    return false;
++                }
++                SRV_INF("%s", "loaded WePM generation, embedding and decision heads\n");
++            }
+             init_opt.video_params.fps_target = params_base.video_fps;
+             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
+             init_opt.video_params.ffmpeg_bin_dir = params_base.video_ffmpeg_bin_dir.empty()
+@@ -2949,6 +2979,39 @@ private:
+         }
+ 
+         switch (task.type) {
++            case SERVER_TASK_TYPE_WEPM:
++                {
++                    try {
++                        auto cancelled = [&] {
++                            return !queue_results.is_waiting(task.id);
++                        };
++                        if (cancelled()) {
++                            break;
++                        }
++                        auto emit = [&](const std::string & text) {
++                            if (!task.wepm_request.value("stream", false)) {
++                                return;
++                            }
++                            auto result   = std::make_unique<server_task_result_wepm>();
++                            result->id    = task.id;
++                            result->final = false;
++                            result->body  = {
++                                { "content", text }
++                            };
++                            queue_results.send(std::move(result));
++                        };
++                        auto result  = std::make_unique<server_task_result_wepm>();
++                        result->id   = task.id;
++                        result->body = json::parse(wepm_engine
++                                                       ->run(wepm::json::parse(task.wepm_request.dump()),
++                                                             task.wepm_images, task.params.sampling, emit, cancelled)
++                                                       .dump(-1, ' ', false, wepm::json::error_handler_t::replace));
++                        queue_results.send(std::move(result));
++                    } catch (const std::exception & e) {
++                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
++                    }
++                    break;
++                }
+             case SERVER_TASK_TYPE_COMPLETION:
+             case SERVER_TASK_TYPE_INFILL:
+             case SERVER_TASK_TYPE_TRANSCRIBE_RT:
+@@ -2958,6 +3021,10 @@ private:
+             case SERVER_TASK_TYPE_TTS:
+             case SERVER_TASK_TYPE_DECISION:
+                 {
++                    if (wepm_engine) {
++                        send_error(task, "unsupported endpoint for WePM task slots", ERROR_TYPE_NOT_SUPPORTED);
++                        break;
++                    }
+                     if (task.need_sampling() && !decision.can_generate()) {
+                         send_error(task, "This model is a decision model without text generation, use /v1/systemone", ERROR_TYPE_NOT_SUPPORTED);
+                         break;
+@@ -5265,6 +5332,187 @@ void server_context::set_video_decoder(const mtmd_helper_video_decoder * decoder
+ // server_routes
+ //
+ 
++std::unique_ptr<server_res_generator> server_routes::handle_wepm(const server_http_req & req,
++                                                                 const std::string &     mode) {
++    auto res = create_response();
++    res->set_req(&req);
++    try {
++        const json  body = json::parse(req.body);
++        bool        chat = mode == "chat", generate = chat || mode == "completion";
++        bool        stream = generate && body.value("stream", false);
++        server_task task(SERVER_TASK_TYPE_WEPM);
++        task.id   = res->rd.get_new_id();
++        json work = {
++            { "task",   generate ? "generate" : mode },
++            { "stream", stream                       }
++        };
++        std::string       prompt;
++        const std::string image = "<|vision_start|><|image_pad|><|vision_end|>";
++        auto              media = [&](std::string value) {
++            if (value.rfind("data:", 0) == 0) {
++                auto split = value.find(";base64,");
++                if (split == std::string::npos) {
++                    throw std::invalid_argument("expected base64 image");
++                }
++                value.erase(0, split + 8);
++            }
++            if (value.size() > 64 * 1024 * 1024 || task.wepm_images.size() >= 64) {
++                throw std::invalid_argument("media limit exceeded");
++            }
++            task.wepm_images.push_back(base64::decode(value));
++        };
++        auto content = [&](const json & value) {
++            if (value.is_string()) {
++                prompt += value.get<std::string>();
++                return;
++            }
++            for (const auto & part : value) {
++                if (part.at("type") == "text") {
++                    prompt += part.at("text").get<std::string>();
++                } else if (part.at("type") == "image_url") {
++                    media(part.at("image_url").at("url"));
++                    prompt += image;
++                } else {
++                    throw std::invalid_argument("unsupported WePM content part");
++                }
++            }
++        };
++        if (mode == "decision") {
++            work["state"]     = body.value("state", json(nullptr));
++            work["questions"] = body.at("questions");
++            for (const auto & im : body.value("images", json::array())) {
++                media(im);
++                prompt += image;
++            }
++        } else if (chat) {
++            for (const auto & msg : body.at("messages")) {
++                auto role = msg.at("role").get<std::string>();
++                if (role != "user" && role != "assistant" && role != "system") {
++                    throw std::invalid_argument("unsupported chat role");
++                }
++                prompt += "<|im_start|>" + role + "\n";
++                content(msg.at("content"));
++                prompt += "<|im_end|>\n";
++            }
++            prompt += "<|im_start|>assistant\n";
++        } else {
++            const auto & input = body.at(generate ? "prompt" : "input");
++            if (input.is_object() && input.contains("prompt_string")) {
++                prompt                   = input.at("prompt_string").get<std::string>();
++                const std::string marker = get_media_marker();
++                size_t            pos    = 0;
++                for (const auto & im : input.at("multimodal_data")) {
++                    pos = prompt.find(marker, pos);
++                    if (pos == std::string::npos) {
++                        throw std::invalid_argument("missing media marker");
++                    }
++                    prompt.replace(pos, marker.size(), image);
++                    pos += image.size();
++                    media(im);
++                }
++            } else if (input.is_object()) {
++                content(input.at("content"));
++            } else {
++                content(input);
++            }
++        }
++        work["prompt"] = prompt;
++        if (generate) {
++            task.params = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog, body);
++            work["max_tokens"] = body.value("max_tokens", body.value("n_predict", -1));
++            if (body.contains("stop") && !body.at("stop").is_null()) {
++                work["stop"] = body.at("stop").is_string() ? json::array({ body.at("stop") }) : body.at("stop");
++            }
++        } else if (mode == "embed") {
++            work["dimensions"] = body.value("dimensions", 2048);
++            work["truncate"] = body.value("truncate", false);
++        }
++        task.wepm_request = std::move(work);
++        res->rd.post_task(std::move(task));
++        auto first = res->rd.next(req.should_stop);
++        if (!first) {
++            return res;
++        }
++        if (first->is_error()) {
++            res->error(first->to_json());
++            return res;
++        }
++        auto format = [mode, chat, stream, id = gen_chatcmplid()](server_task_result & result) {
++            json b     = result.to_json();
++            bool final = result.is_stop();
++            if (mode == "embed") {
++                return json{
++                    { "data",  json::array({ { { "index", 0 },
++                                              { "embedding", b.at("vector") },
++                                              { "tokens_evaluated", b.at("input_tokens") } } }) },
++                    { "usage", { { "prompt_tokens", b.at("input_tokens") } }                                                 }
++                };
++            }
++            if (mode == "decision") {
++                return json{
++                    { "answers", b.at("answers")                               },
++                    { "usage",   { { "prompt_tokens", b.at("input_tokens") } } }
++                };
++            }
++            std::string text = stream && final ? "" : b.at("content").get<std::string>();
++            if (chat) {
++                json reason = final ? json(b.at("stop_type") == "limit" ? "length" : "stop") : json(nullptr);
++                json choice = {
++                    { "index",                      0                                                },
++                    { "finish_reason",              reason                                           },
++                    { stream ? "delta" : "message", { { "role", "assistant" }, { "content", text } } }
++                };
++                json out = {
++                    { "id",      id                                                   },
++                    { "object",  stream ? "chat.completion.chunk" : "chat.completion" },
++                    { "choices", json::array({ choice })                              }
++                };
++                if (final) {
++                    out["timings"] = b.at("timings");
++                    out["usage"]   = {
++                        { "prompt_tokens",     b.at("input_tokens")        },
++                        { "completion_tokens", b["timings"]["predicted_n"] }
++                    };
++                }
++                return out;
++            }
++            b["content"] = text;
++            b["stop"]    = final;
++            return b;
++        };
++        if (!stream) {
++            res->ok(format(*first));
++            return res;
++        }
++        res->data         = format_oai_sse(format(*first));
++        res->content_type = "text/event-stream";
++        res->set_next([r = res.get(), format, chat](std::string & out) {
++            if (!r->data.empty()) {
++                out.swap(r->data);
++                r->data.clear();
++                return true;
++            }
++            if (!r->rd.has_next()) {
++                out = chat ? "data: [DONE]\n\n" : "";
++                return false;
++            }
++            auto result = r->rd.next([r] { return r->should_stop(); });
++            if (!result) {
++                return false;
++            }
++            out = format_oai_sse(result->is_error() ?
++                                     json{
++                                         { "error", result->to_json() }
++            } :
++                                     format(*result));
++            return true;
++        });
++    } catch (const std::exception & e) {
++        res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
++    }
++    return res;
++}
++
+ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             const server_http_req & req,
+             server_task_type type,
+@@ -5958,6 +6206,9 @@ void server_routes::init_routes() {
+ 
+     this->post_completions = [this](const server_http_req & req) {
+         auto res = create_response();
++        if (ctx_server.wepm_engine) {
++            return handle_wepm(req, "completion");
++        }
+         std::vector<raw_buffer> files; // dummy
+         const json body = json::parse(req.body);
+         return handle_completions_impl(
+@@ -5982,6 +6233,9 @@ void server_routes::init_routes() {
+ 
+     this->post_chat_completions = [this](const server_http_req & req) {
+         auto res = create_response();
++        if (ctx_server.wepm_engine) {
++            return handle_wepm(req, "chat");
++        }
+         std::vector<raw_buffer> files;
+         json body = json::parse(req.body);
+         common_chat_session session;
+@@ -6474,6 +6728,9 @@ void server_routes::init_routes() {
+ 
+     this->post_systemone = [this](const server_http_req & req) {
+         auto res = create_response();
++        if (ctx_server.wepm_engine) {
++            return handle_wepm(req, "decision");
++        }
+         const auto & decision = ctx_server.decision;
+         if (decision.type == COMMON_DECISION_TYPE_NONE) {
+             res->error(format_error_response("This model is not a decision model", ERROR_TYPE_NOT_SUPPORTED));
+@@ -6738,6 +6995,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
+ 
+ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {
+     auto res = create_response();
++    if (ctx_server.wepm_engine) {
++        return handle_wepm(req, "embed");
++    }
+     if (!params.embedding) {
+         res->error(format_error_response("This server does not support embeddings. Start it with `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
+         return res;
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 2c91d53..2fa62a5 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -148,6 +148,7 @@ struct server_routes {
+     json get_model_info() const;
+ 
+ private:
++    std::unique_ptr<server_res_generator> handle_wepm(const server_http_req & req, const std::string & mode);
+     std::unique_ptr<server_res_generator> handle_completions_impl(
+             const server_http_req & req,
+             server_task_type type,
+diff --git a/tools/server/server-queue.h b/tools/server/server-queue.h
+index f9d66be..7cc5106 100644
+--- a/tools/server/server-queue.h
++++ b/tools/server/server-queue.h
+@@ -171,6 +171,10 @@ private:
+ 
+ public:
+     // add the id_task to the list of tasks waiting for response
++  bool is_waiting(int id) {
++      std::lock_guard<std::mutex> lock(mutex_results);
++      return waiting_task_ids.count(id) != 0;
++  }
+     void add_waiting_task_id(int id_task);
+ 
+     void add_waiting_task_ids(const std::unordered_set<int> & id_tasks);
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 234cd36..7d24f59 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -12,7 +12,6 @@
+ #include "server-common.h"
+ #include "mtmd-helper.h"
+ 
+-
+ enum server_task_type {
+     SERVER_TASK_TYPE_COMPLETION,
+     SERVER_TASK_TYPE_EMBEDDING,
+@@ -20,11 +19,12 @@ enum server_task_type {
+     SERVER_TASK_TYPE_DECISION,
+     SERVER_TASK_TYPE_INFILL,
+     SERVER_TASK_TYPE_TRANSCRIBE_RT,
+-    SERVER_TASK_TYPE_REALTIME, // a conversation over /v1/realtime, see server-realtime.cpp
++    SERVER_TASK_TYPE_REALTIME,  // a conversation over /v1/realtime, see server-realtime.cpp
+     SERVER_TASK_TYPE_CANCEL,
+     SERVER_TASK_TYPE_CONTROL,
+     SERVER_TASK_TYPE_NEXT_RESPONSE,
+     SERVER_TASK_TYPE_METRICS,
++    SERVER_TASK_TYPE_WEPM,
+     SERVER_TASK_TYPE_SLOT_GET,
+     SERVER_TASK_TYPE_SLOT_SAVE,
+     SERVER_TASK_TYPE_SLOT_RESTORE,
+@@ -191,6 +191,8 @@ struct server_task {
+     std::string             cli_prompt;
+     std::vector<raw_buffer> cli_files;
+ 
++    json                     wepm_request;
++    std::vector<std::string> wepm_images;
+     server_task_type type;
+ 
+     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
+@@ -388,6 +390,15 @@ struct server_task_result {
+ // using shared_ptr for polymorphism of server_task_result
+ using server_task_result_ptr = std::unique_ptr<server_task_result>;
+ 
++struct server_task_result_wepm : server_task_result {
++    json body;
++    bool final = true;
++
++    bool is_stop() override { return final; }
++
++    json to_json() override { return body; }
++};
++
+ struct completion_token_output {
+     llama_token tok;
+     float prob;
+diff --git a/tools/server/wepm/blas.hpp b/tools/server/wepm/blas.hpp
+new file mode 100644
+index 0000000..eedd563
+--- /dev/null
++++ b/tools/server/wepm/blas.hpp
+@@ -0,0 +1,69 @@
++// The projection matrices are row-major. Prefer the platform BLAS when available.
++#pragma once
++#ifdef WEPM_USE_ACCELERATE
++#    include <Accelerate/Accelerate.h>
++#elif defined(WEPM_USE_CBLAS)
++#    include <cblas.h>
++#else
++#    include <algorithm>
++#    include <cmath>
++
++namespace wepm {
++enum { CblasRowMajor, CblasNoTrans, CblasTrans };
++
++inline float cblas_sdot(int n, const float * x, int ix, const float * y, int iy) {
++    float sum = 0;
++    for (int i = 0; i < n; ++i) {
++        sum += x[i * ix] * y[i * iy];
++    }
++    return sum;
++}
++
++inline void cblas_saxpy(int n, float a, const float * x, int ix, float * y, int iy) {
++    for (int i = 0; i < n; ++i) {
++        y[i * iy] += a * x[i * ix];
++    }
++}
++
++inline void cblas_sscal(int n, float a, float * x, int ix) {
++    for (int i = 0; i < n; ++i) {
++        x[i * ix] *= a;
++    }
++}
++
++inline float cblas_snrm2(int n, const float * x, int ix) {
++    return std::sqrt(cblas_sdot(n, x, ix, x, ix));
++}
++
++inline void cblas_sgemm(int,
++                        int,
++                        int           trans_b,
++                        int           m,
++                        int           n,
++                        int           k,
++                        float         alpha,
++                        const float * a,
++                        int           lda,
++                        const float * b,
++                        int           ldb,
++                        float         beta,
++                        float *       c,
++                        int           ldc) {
++    for (int i = 0; i < m; ++i) {
++        float * row = c + i * ldc;
++        for (int j = 0; j < n; ++j) {
++            row[j] *= beta;
++        }
++        if (trans_b == CblasTrans) {
++            for (int j = 0; j < n; ++j) {
++                row[j] += alpha * cblas_sdot(k, a + i * lda, 1, b + j * ldb, 1);
++            }
++        } else {
++            for (int p = 0; p < k; ++p) {
++                cblas_saxpy(n, alpha * a[i * lda + p], b + p * ldb, 1, row, 1);
++            }
++        }
++    }
++}
++}  // namespace wepm
++#endif
+diff --git a/tools/server/wepm/decision.hpp b/tools/server/wepm/decision.hpp
+new file mode 100644
+index 0000000..156c054
+--- /dev/null
++++ b/tools/server/wepm/decision.hpp
+@@ -0,0 +1,114 @@
++// Visible SystemOne prompt and candidate-row order for task_slots_v1.
++#pragma once
++
++#include "nlohmann/json.hpp"
++
++#include <algorithm>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace wepm {
++using DecisionJson = nlohmann::ordered_json;
++
++struct Decision {
++    std::string              kind, prompt;
++    std::vector<std::string> ids;
++    std::vector<std::string> descriptions;
++
++    DecisionJson answer(const std::vector<float> & probabilities) const {
++        DecisionJson answer = {
++            { "type", kind }
++        };
++        if (kind == "noul") {
++            answer["noul"] = probabilities.at(1);
++        } else {
++            for (size_t i = 0; i < ids.size(); ++i) {
++                answer["probabilities"][ids[i]] = probabilities.at(i);
++            }
++        }
++        if (kind == "choice") {
++            answer["choice"] =
++                ids.at(std::max_element(probabilities.begin(), probabilities.end()) - probabilities.begin());
++        } else if (kind == "score") {
++            double score = 0;
++            for (size_t i = 0; i < ids.size(); ++i) {
++                score += i * probabilities[i];
++                answer["legend"][ids[i]] = descriptions[i];
++            }
++            answer["score"] = score;
++        }
++        return {
++            { "q", answer }
++        };
++    }
++};
++
++inline bool visible(const std::string & text) {
++    return text.find_first_not_of(" \t\n\r\f\v") != std::string::npos;
++}
++
++inline Decision render_decision(const DecisionJson & request) {
++    const auto & questions = request.at("questions");
++    if (!questions.is_object() || questions.size() != 1 || !questions.contains("q")) {
++        throw std::runtime_error("expected questions.q");
++    }
++    const auto & q           = questions.at("q");
++    const auto   kind        = q.at("type").get<std::string>();
++    auto         instruction = q.at("instructions").get<std::string>();
++    if (!visible(instruction)) {
++        throw std::runtime_error("empty instructions");
++    }
++    const auto & state = request.at("state");
++    std::string  context;
++    if (state.is_null() || state == "") {
++        context = instruction;
++    } else if (state.is_string()) {
++        context = state.get<std::string>();
++    } else if (state.is_object()) {
++        context = nlohmann::json::parse(state.dump()).dump();  // recursively sort state keys
++    } else {
++        throw std::runtime_error("invalid state");
++    }
++    Decision result{ kind,
++                     "Evaluate the candidates using the context and instructions.\nContext:\n" + context +
++                         "\nDecision type: " + kind + "\nInstructions:\n" + instruction + "\nCandidates:",
++                     {} };
++    auto     append = [&](const std::string & id, const std::string & description) {
++        if (id.empty() || !visible(description)) {
++            throw std::runtime_error("empty candidate");
++        }
++        result.prompt += "\n" + std::to_string(result.ids.size()) + ": ";
++        if (kind == "choice") {
++            result.prompt += "id=" + DecisionJson(id).dump() + " description=";
++        }
++        result.prompt += DecisionJson(description).dump();
++        result.ids.push_back(id);
++        result.descriptions.push_back(description);
++    };
++    if (kind == "noul") {
++        if (q.contains("criteria")) {
++            throw std::runtime_error("noul has no criteria");
++        }
++        append("false", "No / false");
++        append("true", "Yes / true");
++    } else {
++        const auto & criteria = q.at("criteria");
++        if (criteria.size() < 2 || criteria.size() > 255) {
++            throw std::runtime_error("invalid candidate count");
++        }
++        if (kind == "choice" && criteria.is_object()) {
++            for (const auto & entry : criteria.items()) {
++                append(entry.key(), entry.value().get<std::string>());
++            }
++        } else if (kind == "score" && criteria.is_array()) {
++            for (const auto & description : criteria) {
++                append(std::to_string(result.ids.size()), description.get<std::string>());
++            }
++        } else {
++            throw std::runtime_error("invalid decision criteria");
++        }
++    }
++    return result;
++}
++}  // namespace wepm
+diff --git a/tools/server/wepm/engine.hpp b/tools/server/wepm/engine.hpp
+new file mode 100644
+index 0000000..e30c846
+--- /dev/null
++++ b/tools/server/wepm/engine.hpp
+@@ -0,0 +1,512 @@
++#pragma once
++#include "common.h"
++#include "decision.hpp"
++#include "ggml-backend.h"
++#include "ggml.h"
++#include "gguf.h"
++#include "heif.hpp"
++#include "llama.h"
++#include "mgvb.hpp"
++#include "mtmd-helper.h"
++#include "mtmd.h"
++#include "nlohmann/json.hpp"
++#include "sampling.h"
++#include "unicode.h"
++
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <memory>
++#include <numeric>
++#include <optional>
++#include <set>
++
++namespace wepm {
++using json                                = nlohmann::ordered_json;
++template <class T, auto Free> using owner = std::unique_ptr<T, decltype(Free)>;
++
++class TensorFile {
++    owner<gguf_context, gguf_free> info{ nullptr, gguf_free };
++    owner<ggml_context, ggml_free> header{ nullptr, ggml_free };
++    std::ifstream                  file;
++  public:
++    explicit TensorFile(const string & path) : file(path, std::ios::binary) {
++        ggml_context * ctx = nullptr;
++        info.reset(gguf_init_from_file(path.c_str(), { true, &ctx }));
++        header.reset(ctx);
++        if (!info || !header || !file) {
++            throw std::runtime_error("cannot read GGUF " + path);
++        }
++    }
++
++    bool has_wepm_vision_profile() const {
++        if (gguf_find_tensor(info.get(), "unimodel.embedding_head.weight") < 0) {
++            return false;
++        }
++        const auto key = gguf_find_key(info.get(), "clip.vision.wepm_task_slots_v1");
++        return key >= 0 && gguf_get_kv_type(info.get(), key) == GGUF_TYPE_BOOL && gguf_get_val_bool(info.get(), key);
++    }
++
++    bool needs_reference_language_backend() const {
++        const auto * table = ggml_get_tensor(header.get(), "token_embd.weight");
++        const auto   key   = gguf_find_key(info.get(), "general.file_type");
++        return table && table->ne[0] == 2048 && key >= 0 && gguf_get_kv_type(info.get(), key) == GGUF_TYPE_UINT32 &&
++               gguf_get_val_u32(info.get(), key) == LLAMA_FTYPE_MOSTLY_Q4_K_M;
++    }
++
++    Matrix read(const string & name, int first = 0, int count = -1) {
++        const auto * t = ggml_get_tensor(header.get(), name.c_str());
++        if (!t || t->ne[2] != 1 || t->ne[3] != 1) {
++            throw std::runtime_error("invalid tensor " + name);
++        }
++        if (count < 0) {
++            count = t->ne[1];
++        }
++        if (first < 0 || count < 1 || first + int64_t(count) > t->ne[1]) {
++            throw std::runtime_error("tensor row outside " + name);
++        }
++        const auto rowbytes = ggml_row_size(t->type, t->ne[0]);
++        int64_t    index    = gguf_find_tensor(info.get(), name.c_str());
++        file.seekg(gguf_get_data_offset(info.get()) + gguf_get_tensor_offset(info.get(), index) + first * rowbytes);
++        vector<char> buf(count * rowbytes);
++        if (!file.read(buf.data(), buf.size())) {
++            throw std::runtime_error("truncated tensor " + name);
++        }
++        Matrix out(count, t->ne[0]);
++        if (t->type == GGML_TYPE_F32) {
++            std::memcpy(out.row(0), buf.data(), buf.size());
++        } else {
++            auto conv = ggml_get_type_traits(t->type)->to_float;
++            if (!conv) {
++                throw std::runtime_error("unsupported tensor type " + name);
++            }
++            conv(buf.data(), out.row(0), int64_t(out.rows) * out.cols);
++        }
++        return out;
++    }
++
++    Weights tasks() {
++        Weights w;
++        for (int i = 0; i < gguf_get_n_tensors(info.get()); ++i) {
++            string n = gguf_get_tensor_name(info.get(), i);
++            if (n.rfind("unimodel.", 0) == 0 && n.find("reconstruction") == string::npos) {
++                w.emplace(n, read(n));
++            }
++        }
++        return w;
++    }
++};
++
++class Engine {
++    llama_context *     ctx;
++    mtmd_context *      vision;
++    llama_model *       language;
++    TensorFile          dictionary;
++    Weights             weights;
++    const llama_vocab * vocab = nullptr;
++    int                 width = 0;
++    int                 ctxlen;
++
++    vector<llama_token> tokenize(const string & text) {
++        vector<llama_token> ids(text.size() + 1);
++        int                 n = llama_tokenize(vocab, text.data(), text.size(), ids.data(), ids.size(), false, true);
++        if (n < 0) {
++            throw std::runtime_error("tokenization failed");
++        }
++        ids.resize(n);
++        return ids;
++    }
++
++    vector<float> evaluate(const Matrix &                     emb,
++                           const vector<std::array<int, 4>> & positions,
++                           bool                               hidden,
++                           const std::function<bool()> &      cancelled) {
++        if (emb.rows != int(positions.size()) || emb.cols != width) {
++            throw std::runtime_error("bad batch");
++        }
++        llama_set_embeddings(ctx, hidden);
++        const int chunk = std::min<int>(256, llama_n_ubatch(ctx));
++        for (int offset = 0; offset < emb.rows; offset += chunk) {
++            if (cancelled()) {
++                throw std::runtime_error("request cancelled");
++            }
++            int                    n = std::min(emb.rows - offset, chunk);
++            vector<llama_pos>      pos(4 * n);
++            vector<int32_t>        counts(n, 1);
++            llama_seq_id           zero = 0;
++            vector<llama_seq_id *> seqs(n, &zero);
++            vector<int8_t>         outputs(n, 0);
++            outputs.back() = 1;
++            for (int i = 0; i < n; ++i) {
++                for (int j = 0; j < 4; ++j) {
++                    pos[j * n + i] = positions[offset + i][j];
++                }
++            }
++            llama_batch b{};
++            b.n_tokens = n;
++            b.embd     = const_cast<float *>(emb.row(offset));
++            b.pos      = pos.data();
++            b.n_seq_id = counts.data();
++            b.seq_id   = seqs.data();
++            b.logits   = outputs.data();
++            if (llama_decode(ctx, b) != 0) {
++                throw std::runtime_error("llama_decode failed");
++            }
++        }
++        auto data = hidden ? llama_get_embeddings_ith(ctx, -1) : llama_get_logits_ith(ctx, -1);
++        if (!data) {
++            throw std::runtime_error("missing model output");
++        }
++        if (!hidden) {
++            return {};
++        }
++        return { data, data + width };
++    }
++
++    struct ImageInput {
++        owner<mtmd_input_chunks, mtmd_input_chunks_free> chunks;
++        const mtmd_input_chunk *                         chunk;
++        int                                              tokens;
++    };
++
++    ImageInput prepare_image(const string & bytes) {
++        owner<mtmd_bitmap, mtmd_bitmap_free> bm(nullptr, mtmd_bitmap_free);
++        if (is_heif(bytes)) {
++            bm.reset(decode_heif(bytes));
++        } else {
++            auto wrapper =
++                mtmd_helper_bitmap_init_from_buf(vision, reinterpret_cast<const unsigned char *>(bytes.data()),
++                                                 bytes.size(), false, mtmd_helper_init_opt_default());
++            mtmd_helper::video_ptr video(wrapper.video_ctx);
++            bm.reset(wrapper.bitmap);
++            if (video) {
++                throw std::invalid_argument("expected a still image");
++            }
++        }
++        if (!bm || mtmd_bitmap_get_nx(bm.get()) == 0) {
++            throw std::invalid_argument("invalid still image");
++        }
++        owner<mtmd_input_chunks, mtmd_input_chunks_free> parts(mtmd_input_chunks_init(), mtmd_input_chunks_free);
++        mtmd_input_part                                  part{ nullptr, bm.get() };
++        const mtmd_input_part *                          input = &part;
++        if (mtmd_tokenize_from_parts(vision, parts.get(), &input, 1, false)) {
++            throw std::runtime_error("image preprocessing failed");
++        }
++        for (size_t i = 0; i < mtmd_input_chunks_size(parts.get()); ++i) {
++            auto chunk = mtmd_input_chunks_get(parts.get(), i);
++            auto img   = mtmd_input_chunk_get_tokens_image(chunk);
++            if (!img) {
++                continue;
++            }
++            const int n = mtmd_input_chunk_get_n_tokens(chunk);
++            if (n <= 0) {
++                throw std::invalid_argument("empty image grid");
++            }
++            return { std::move(parts), chunk, n };
++        }
++        throw std::invalid_argument("image chunk missing");
++    }
++
++    Visual encode(const ImageInput & input, const Matrix * query) {
++        if (mtmd_encode_chunk(vision, input.chunk)) {
++            throw std::runtime_error("image encode failed");
++        }
++        const auto * img  = mtmd_input_chunk_get_tokens_image(input.chunk);
++        const auto   last = mtmd_image_tokens_get_decoder_pos(img, 0, input.tokens - 1);
++        const int    w = last.x + 1, h = last.y + 1;
++        if (w * h != input.tokens) {
++            throw std::invalid_argument("unexpected merger grid");
++        }
++        Matrix v(input.tokens, width);
++        std::copy_n(mtmd_get_output_embd(vision), v.values.size(), v.row(0));
++        return Compressor(weights)(v, h, w, query);
++    }
++  public:
++    Engine(const string &  model,
++           const string &  projector,
++           llama_context * ctx,
++           mtmd_context *  vision,
++           llama_model *   language) :
++        ctx(ctx),
++        vision(vision),
++        language(language),
++        dictionary(model),
++        weights(TensorFile(projector).tasks()),
++        vocab(llama_model_get_vocab(language)),
++        width(llama_model_n_embd(language)),
++        ctxlen(llama_n_ctx_seq(ctx)) {
++        auto require = [&](const string & name, int rows, int cols) {
++            const auto i = weights.find("unimodel." + name);
++            if (i == weights.end() || i->second.rows != rows || i->second.cols != cols) {
++                throw std::runtime_error("invalid WePM tensor shape: " + name);
++            }
++        };
++        require("slot_pooler.embedding_slot", 1, width);
++        require("slot_pooler.decision_slot", 1, width);
++        require("embedding_head.weight", 2048, width);
++        require("decision_head.output.weight", 256, width);
++        require("mgvb.input_norm.weight", 1, width);
++        require("mgvb.input_proj.weight", 512, width);
++        require("mgvb.query_proj.weight", 512, 2 * width);
++        require("mgvb.global_queries", 8, 512);
++        require("mgvb.null_query", 1, 512);
++        require("mgvb.granularity_embedding.weight", 3, width);
++        require("mgvb.output_position.weight", width, 4);
++        for (const string bank : { "global", "region", "fine" }) {
++            const string prefix = "mgvb." + bank + "_";
++            require(prefix + "residual.norm.weight", 1, 512);
++            require(prefix + "residual.norm.bias", 1, 512);
++            require(prefix + "residual.fc1.weight", 1024, 512);
++            require(prefix + "residual.fc2.weight", width, 1024);
++            require(prefix + "value.weight", 512, 512);
++            if (bank == "global") {
++                require(prefix + "key.weight", 512, 512);
++                require(prefix + "query_condition.weight", 512, 512);
++            } else {
++                require(prefix + "query.weight", 512, 512);
++                require(prefix + "position.weight", 512, 4);
++                require(prefix + "score.weight", 1, 512);
++            }
++        }
++    }
++
++    json run(const json &                                request,
++             const vector<string> &                      images_data,
++             common_params_sampling &                    sampling,
++             const std::function<void(const string &)> & emit,
++             const std::function<bool()> &               cancelled) {
++        const string            task     = request.at("task");
++        bool                    generate = task == "generate", embed = task == "embed";
++        string                  text = request.at("prompt");
++        std::optional<Decision> decision;
++        if (!generate && !embed) {
++            if (images_data.size() > 8) {
++                throw std::runtime_error("too many decision images");
++            }
++            decision = render_decision(request);
++            text += decision->prompt;
++        }
++        if (!generate) {
++            text = "<|im_start|>user\n" + text + "<|im_end|>\n";
++        }
++        auto       start = ggml_time_us();
++        auto       ids   = tokenize(text);
++        const auto one   = [&](const string & s) {
++            auto tokens = tokenize(s);
++            if (tokens.size() != 1) {
++                throw std::runtime_error("special token mismatch");
++            }
++            return tokens[0];
++        };
++        int           image = one("<|image_pad|>"), eos = one("<|im_end|>"), pad = one("<|endoftext|>");
++        std::set<int> skip = { pad, eos, image };
++        for (auto s : { "<|vision_start|>", "<|vision_end|>", "<|video_pad|>", "<|audio_start|>", "<|audio_end|>",
++                        "<|audio_pad|>" }) {
++            skip.insert(one(s));
++        }
++        vector<ImageInput> prepared;
++        int64_t            required = int64_t(ids.size()) + 1;
++        for (const auto & bytes : images_data) {
++            if (cancelled()) {
++                throw std::runtime_error("request cancelled");
++            }
++            prepared.push_back(prepare_image(bytes));
++            required += std::min(prepared.back().tokens, 512) - 1;
++        }
++        if (required > ctxlen) {
++            if (!embed || !request.value("truncate", false)) {
++                throw std::invalid_argument("input exceeds context length");
++            }
++            const auto prefix = tokenize("<|im_start|>user\n").size(), suffix = tokenize("<|im_end|>\n").size();
++            int64_t    excess = required - ctxlen;
++            // Keep both framing tokens and every image in its original position.
++            // Recompute the MGVB query below from the retained text.
++            vector<llama_token> kept;
++            kept.reserve(ids.size());
++            for (size_t j = ids.size(); j-- > 0;) {
++                if (excess && j >= prefix && j + suffix < ids.size() && !skip.count(ids[j])) {
++                    --excess;
++                    continue;
++                }
++                kept.push_back(ids[j]);
++            }
++            if (excess) {
++                throw std::invalid_argument("images exceed context length");
++            }
++            ids.assign(kept.rbegin(), kept.rend());
++        }
++        Matrix                query(1, 2 * width);
++        std::map<int, Matrix> rows;
++        int                   count = 0, images = 0;
++        for (int token : ids) {
++            if (token == image) {
++                ++images;
++                continue;
++            }
++            if (!rows.count(token)) {
++                rows.emplace(token, dictionary.read("token_embd.weight", token, 1));
++            }
++            if (skip.count(token)) {
++                continue;
++            }
++            auto v = rows.at(token).row(0);
++            cblas_saxpy(width, 1, v, 1, query.row(0), 1);
++            std::copy_n(v, width, query.row(0) + width);
++            ++count;
++        }
++        if (images != int(images_data.size())) {
++            throw std::runtime_error("unmatched image marker");
++        }
++        if (count) {
++            cblas_sscal(width, 1.f / count, query.row(0), 1);
++        }
++        if (!generate) {
++            ids.push_back(pad);
++        }
++        vector<float>              data;
++        vector<std::array<int, 4>> positions;
++        vector<int>                native, compact;
++        int                        rope = 0;
++        for (size_t i = 0; i < ids.size(); ++i) {
++            if (ids[i] == image) {
++                if (cancelled()) {
++                    throw std::runtime_error("request cancelled");
++                }
++                const auto & input  = prepared.at(native.size());
++                auto         visual = encode(input, count ? &query : nullptr);
++                native.push_back(input.tokens);
++                compact.push_back(visual.tokens.rows);
++                int max_pos = 0;
++                for (auto p : visual.pos) {
++                    positions.push_back({ int(positions.size()), rope + p[1], rope + p[2], rope + p[0] });
++                    max_pos = std::max({ max_pos, p[0], p[1], p[2] });
++                }
++                rope += max_pos + 1;
++                data.insert(data.end(), visual.tokens.values.begin(), visual.tokens.values.end());
++            } else {
++                bool         slot = !generate && i + 1 == ids.size();
++                const auto & v    = slot ? weights.at(embed ? "unimodel.slot_pooler.embedding_slot" :
++                                                              "unimodel.slot_pooler.decision_slot") :
++                                           rows.at(ids[i]);
++                data.insert(data.end(), v.values.begin(), v.values.end());
++                positions.push_back({ int(positions.size()), rope, rope, rope });
++                ++rope;
++            }
++        }
++        int n = positions.size(), limit = generate ? request.value("max_tokens", 8) : 0;
++        if (n > ctxlen || (generate && n >= ctxlen)) {
++            throw std::runtime_error("prompt exceeds context length");
++        }
++        limit = limit < 0 ? ctxlen - n : std::min(limit, ctxlen - n);
++        Matrix batch(n, width);
++        batch.values.swap(data);
++        llama_memory_clear(llama_get_memory(ctx), true);
++        llama_set_causal_attn(ctx, true);
++        if (cancelled()) {
++            throw std::runtime_error("request cancelled");
++        }
++        auto output    = evaluate(batch, positions, !generate, cancelled);
++        auto prefilled = ggml_time_us();
++        json r         = {
++            { "native",       native  },
++            { "compact",      compact },
++            { "input_tokens", n       }
++        };
++        if (generate) {
++            owner<common_sampler, common_sampler_free> sampler(common_sampler_init(language, sampling),
++                                                               common_sampler_free);
++            if (!sampler) {
++                throw std::runtime_error("invalid sampler");
++            }
++            for (auto id : ids) {
++                common_sampler_accept(sampler.get(), id, false);
++            }
++            string pending, full;
++            bool   ended     = false;
++            int    predicted = 0;
++            auto   stops     = request.value("stop", vector<string>{});
++            for (int step = 0; step < limit; ++step) {
++                if (cancelled()) {
++                    throw std::runtime_error("request cancelled");
++                }
++                const auto token = common_sampler_sample(sampler.get(), ctx, -1);
++                ++predicted;
++                if (llama_vocab_is_eog(vocab, token)) {
++                    ended = true;
++                    break;
++                }
++                common_sampler_accept(sampler.get(), token, true);
++                pending += common_token_to_piece(vocab, token, false);
++                size_t hold = 0;
++                for (const auto & stop : stops) {
++                    if (stop.empty()) {
++                        continue;
++                    }
++                    auto pos = pending.find(stop);
++                    if (pos != string::npos) {
++                        pending.resize(pos);
++                        ended = true;
++                        break;
++                    }
++                    for (size_t k = 1; k <= std::min(stop.size() - 1, pending.size()); ++k) {
++                        if (pending.compare(pending.size() - k, k, stop, 0, k) == 0) {
++                            hold = std::max(hold, k);
++                        }
++                    }
++                }
++                auto part = pending.substr(0, pending.size() - std::min(hold, pending.size()));
++                if (!part.empty() && common_utf8_is_complete(part)) {
++                    full += part;
++                    emit(part);
++                    pending.erase(0, part.size());
++                }
++                if (ended || step + 1 == limit) {
++                    break;
++                }
++                evaluate(dictionary.read("token_embd.weight", token, 1),
++                         {
++                             { n + step, rope + step, rope + step, rope + step }
++                },
++                         false, cancelled);
++            }
++            if (!pending.empty()) {
++                full += pending;
++                emit(pending);
++            }
++            r["content"]   = full;
++            r["stop_type"] = ended ? "eos" : "limit";
++            r["timings"]   = {
++                { "prompt_n",     n                                     },
++                { "prompt_ms",    (prefilled - start) / 1000.0          },
++                { "predicted_n",  predicted                             },
++                { "predicted_ms", (ggml_time_us() - prefilled) / 1000.0 }
++            };
++        } else {
++            Matrix hidden(1, width);
++            hidden.values  = std::move(output);
++            auto projected = linear(
++                hidden, weights.at(embed ? "unimodel.embedding_head.weight" : "unimodel.decision_head.output.weight"));
++            if (embed) {
++                int dim = request.value("dimensions", 2048);
++                if (dim < 64 || dim > 2048 || (dim & (dim - 1))) {
++                    throw std::runtime_error("invalid dimension");
++                }
++                projected.values.resize(dim);
++                float norm = cblas_snrm2(dim, projected.row(0), 1);
++                if (!(norm > 0) || !std::isfinite(norm)) {
++                    throw std::runtime_error("invalid embedding");
++                }
++                cblas_sscal(dim, 1 / norm, projected.row(0), 1);
++                r["vector"] = projected.values;
++            } else {
++                int choices = decision->ids.size();
++                projected.values.resize(choices);
++                softmax(projected.row(0), choices);
++                r["answers"] = decision->answer(projected.values);
++            }
++        }
++        return r;
++    }
++};
++
++}  // namespace wepm
+diff --git a/tools/server/wepm/heif.hpp b/tools/server/wepm/heif.hpp
+new file mode 100644
+index 0000000..6dd63d6
+--- /dev/null
++++ b/tools/server/wepm/heif.hpp
+@@ -0,0 +1,64 @@
++#pragma once
++#include "mtmd.h"
++
++#include <cstring>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++#ifdef WEPM_USE_HEIF
++#    include <libheif/heif.h>
++#endif
++
++namespace wepm {
++inline bool is_heif(const std::string & data) {
++    if (data.size() < 12 || data.compare(4, 4, "ftyp") != 0) {
++        return false;
++    }
++    const auto brand = data.substr(8, 4);
++    return brand == "heic" || brand == "heix" || brand == "mif1" || brand == "hevc" || brand == "hevx";
++}
++
++inline mtmd_bitmap * decode_heif(const std::string & data) {
++#ifdef WEPM_USE_HEIF
++    auto check = [](heif_error err) {
++        if (err.code != heif_error_Ok) {
++            throw std::invalid_argument(err.message ? err.message : "invalid HEIF image");
++        }
++    };
++    std::unique_ptr<heif_context, decltype(&heif_context_free)> ctx(heif_context_alloc(), heif_context_free);
++    if (!ctx) {
++        throw std::bad_alloc();
++    }
++    check(heif_context_read_from_memory_without_copy(ctx.get(), data.data(), data.size(), nullptr));
++    heif_image_handle * handle = nullptr;
++    check(heif_context_get_primary_image_handle(ctx.get(), &handle));
++    std::unique_ptr<heif_image_handle, decltype(&heif_image_handle_release)> owner(handle, heif_image_handle_release);
++    const int width = heif_image_handle_get_width(handle), height = heif_image_handle_get_height(handle);
++    if (width < 1 || height < 1 || int64_t(width) * height > 100000000) {
++        throw std::invalid_argument("invalid HEIF image dimensions");
++    }
++    heif_image * image = nullptr;
++    check(heif_decode_image(handle, &image, heif_colorspace_RGB, heif_chroma_interleaved_RGB, nullptr));
++    std::unique_ptr<heif_image, decltype(&heif_image_release)> decoded(image, heif_image_release);
++    int                                                        stride = 0;
++    auto      plane = heif_image_get_plane_readonly(image, heif_channel_interleaved, &stride);
++    const int w     = heif_image_get_width(image, heif_channel_interleaved);
++    const int h     = heif_image_get_height(image, heif_channel_interleaved);
++    if (!plane || w < 1 || h < 1 || int64_t(w) * h > 100000000 || stride < w * 3) {
++        throw std::invalid_argument("invalid HEIF RGB plane");
++    }
++    if (stride == w * 3) {
++        return mtmd_bitmap_init(w, h, plane);
++    }
++    std::vector<unsigned char> pixels(size_t(w) * h * 3);
++    for (int y = 0; y < h; ++y) {
++        std::memcpy(pixels.data() + size_t(y) * w * 3, plane + size_t(y) * stride, size_t(w) * 3);
++    }
++    return mtmd_bitmap_init(w, h, pixels.data());
++#else
++    (void) data;
++    throw std::invalid_argument("HEIF input requires a runner built with libheif");
++#endif
++}
++}  // namespace wepm
+diff --git a/tools/server/wepm/mgvb.hpp b/tools/server/wepm/mgvb.hpp
+new file mode 100644
+index 0000000..fb6e539
+--- /dev/null
++++ b/tools/server/wepm/mgvb.hpp
+@@ -0,0 +1,227 @@
++// Query-conditioned visual compression for WePM task_slots_v1.
++#pragma once
++#include "blas.hpp"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <map>
++#include <stdexcept>
++#include <string>
++#include <tuple>
++#include <vector>
++
++namespace wepm {
++using std::string;
++using std::vector;
++
++struct Matrix {
++    int           rows, cols;
++    vector<float> values;
++
++    Matrix(int r, int c) : rows(r), cols(c), values(size_t(r) * c) {}
++
++    float * row(int i) { return values.data() + size_t(i) * cols; }
++
++    const float * row(int i) const { return values.data() + size_t(i) * cols; }
++};
++
++using Weights = std::map<string, Matrix>;
++
++inline Matrix linear(const Matrix & x, const Matrix & w) {
++    if (x.cols != w.cols) {
++        throw std::runtime_error("linear dimension mismatch");
++    }
++    Matrix y(x.rows, w.rows);
++    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, x.rows, w.rows, x.cols, 1, x.row(0), x.cols, w.row(0), w.cols,
++                0, y.row(0), y.cols);
++    return y;
++}
++
++inline void softmax(float * x, int n) {
++    float mx = *std::max_element(x, x + n), sum = 0;
++    for (int i = 0; i < n; ++i) {
++        sum += (x[i] = std::exp(x[i] - mx));
++    }
++    for (int i = 0; i < n; ++i) {
++        x[i] /= sum;
++    }
++}
++
++struct Cell {
++    int top, left, bottom, right;
++};
++
++inline vector<Cell> partition(int h, int w, int count) {
++    vector<Cell> cells = {
++        { 0, 0, h, w }
++    };
++    auto rank = [](Cell c) {
++        int h = c.bottom - c.top, w = c.right - c.left;
++        return std::make_pair(h * w, std::max(h, w));
++    };
++    while (int(cells.size()) < count) {
++        auto it = std::max_element(cells.begin(), cells.end(), [&](Cell a, Cell b) { return rank(a) < rank(b); });
++        Cell a = *it, b = *it;
++        cells.erase(it);
++        if (a.right - a.left >= a.bottom - a.top) {
++            a.right = b.left = (a.left + a.right) / 2;
++        } else {
++            a.bottom = b.top = (a.top + a.bottom) / 2;
++        }
++        cells.push_back(a);
++        cells.push_back(b);
++    }
++    auto key = [](Cell c) {
++        return std::make_tuple(c.top, c.left, c.bottom, c.right);
++    };
++    std::sort(cells.begin(), cells.end(), [&](Cell a, Cell b) { return key(a) < key(b); });
++    return cells;
++}
++
++using Pos = std::array<int, 3>;  // t, y, x
++
++struct Visual {
++    Matrix      tokens;
++    vector<Pos> pos;
++};
++
++class Compressor {
++    const Weights & weights;
++
++    const Matrix & get(const string & name) const { return weights.at("unimodel.mgvb." + name); }
++
++    Matrix project(const Matrix & x, const string & name) const { return linear(x, get(name + ".weight")); }
++
++    Matrix residual(Matrix x, const string & bank) const {
++        string      name   = bank + "_residual.";
++        const auto &weight = get(name + "norm.weight"), &bias = get(name + "norm.bias");
++        for (int r = 0; r < x.rows; ++r) {
++            float * v    = x.row(r);
++            double  mean = 0, var = 0;
++            for (int j = 0; j < x.cols; ++j) {
++                mean += v[j];
++            }
++            mean /= x.cols;
++            for (int j = 0; j < x.cols; ++j) {
++                var += std::pow(v[j] - mean, 2);
++            }
++            float inv = 1 / std::sqrt(var / x.cols + 1e-5);
++            for (int j = 0; j < x.cols; ++j) {
++                v[j] = float(v[j] - mean) * inv * weight.values[j] + bias.values[j];
++            }
++        }
++        x = project(x, name + "fc1");
++        for (float & v : x.values) {
++            v = 0.5f * v * (1 + std::erf(v * 0.7071067811865475f));
++        }
++        return project(x, name + "fc2");
++    }
++  public:
++    explicit Compressor(const Weights & weights) : weights(weights) {}
++
++    Visual operator()(const Matrix & native, int h, int w, const Matrix * text) const {
++        if (native.rows != h * w || h <= 0 || w <= 0) {
++            throw std::runtime_error("invalid vision grid");
++        }
++        if (native.rows <= 512) {
++            Visual out{ native, {} };
++            for (int i = 0; i < native.rows; ++i) {
++                out.pos.push_back({ 0, i / w, i % w });
++            }
++            return out;
++        }
++        int          n = native.rows, H = native.cols;
++        Matrix       xn   = native;
++        const auto & norm = get("input_norm.weight");
++        for (int i = 0; i < n; ++i) {
++            float * row = xn.row(i);
++            float   inv = 1 / std::sqrt(cblas_sdot(H, row, 1, row, 1) / H + 1e-6f);
++            for (int j = 0; j < H; ++j) {
++                row[j] *= inv * norm.values[j];
++            }
++        }
++        auto       a = project(xn, "input_proj");
++        const int  d = a.cols, heads = 8, dh = d / heads;
++        const auto query = text ? project(*text, "query_proj") : get("null_query");
++        auto       q     = get("global_queries");
++        auto       shift = project(query, "global_query_condition");
++        auto       k = project(a, "global_key"), v = project(a, "global_value");
++        Matrix     maps(8, n), pooled(8, d);
++        for (int g = 0; g < 8; ++g) {
++            for (int j = 0; j < d; ++j) {
++                q.row(g)[j] += shift.values[j];
++            }
++            for (int head = 0; head < heads; ++head) {
++                vector<float> p(n);
++                const int     start = head * dh;
++                for (int i = 0; i < n; ++i) {
++                    p[i] = cblas_sdot(dh, q.row(g) + start, 1, k.row(i) + start, 1) / std::sqrt(float(dh));
++                }
++                softmax(p.data(), n);
++                for (int i = 0; i < n; ++i) {
++                    maps.row(g)[i] += p[i] / heads;
++                    cblas_saxpy(dh, p[i], v.row(i) + start, 1, pooled.row(g) + start, 1);
++                }
++            }
++        }
++        Visual out{ Matrix(512, H), {} };
++        auto   rg = residual(std::move(pooled), "global");
++        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 8, H, n, 1, maps.row(0), n, native.row(0), H, 0,
++                    out.tokens.row(0), H);
++        cblas_saxpy(8 * H, 1, rg.row(0), 1, out.tokens.row(0), 1);
++        out.pos.assign(8, Pos{ 0, (h - 1) / 2, (w - 1) / 2 });
++        Matrix coords(n, 4);
++        for (int i = 0; i < n; ++i) {
++            coords.row(i)[1] = float(i / w) / std::max(1, h - 1);
++            coords.row(i)[2] = float(i % w) / std::max(1, w - 1);
++            coords.row(i)[3] = 1.0f / n;
++        }
++        for (const string bank : { "region", "fine" }) {
++            int  count = bank == "region" ? 64 : 440, halo = bank == "region" ? 1 : 0, offset = out.pos.size();
++            auto scores = project(a, bank + "_value"), qp = project(query, bank + "_query"),
++                 pp = project(coords, bank + "_position");
++            for (int i = 0; i < n; ++i) {
++                for (int j = 0; j < d; ++j) {
++                    scores.row(i)[j] = std::tanh(scores.row(i)[j] + qp.values[j] + pp.row(i)[j]);
++                }
++            }
++            auto   logits = project(scores, bank + "_score");
++            Matrix pa(count, d);
++            auto   cells = partition(h, w, count);
++            for (int z = 0; z < count; ++z) {
++                Cell c = cells[z];
++                out.pos.push_back({ 0, (c.top + c.bottom - 1) / 2, (c.left + c.right - 1) / 2 });
++                vector<int>   indices;
++                vector<float> p;
++                for (int y = std::max(0, c.top - halo); y < std::min(h, c.bottom + halo); ++y) {
++                    for (int x = std::max(0, c.left - halo); x < std::min(w, c.right + halo); ++x) {
++                        indices.push_back(y * w + x);
++                        p.push_back(logits.values[y * w + x]);
++                    }
++                }
++                softmax(p.data(), p.size());
++                for (size_t j = 0; j < p.size(); ++j) {
++                    cblas_saxpy(H, p[j], native.row(indices[j]), 1, out.tokens.row(offset + z), 1);
++                    cblas_saxpy(d, p[j], a.row(indices[j]), 1, pa.row(z), 1);
++                }
++            }
++            auto res = residual(std::move(pa), bank);
++            cblas_saxpy(count * H, 1, res.row(0), 1, out.tokens.row(offset), 1);
++        }
++        Matrix pc(512, 4);
++        for (int i = 0; i < 512; ++i) {
++            pc.row(i)[1] = float(out.pos[i][1]) / std::max(1, h - 1);
++            pc.row(i)[2] = float(out.pos[i][2]) / std::max(1, w - 1);
++        }
++        auto         decor = project(pc, "output_position");
++        const auto & type  = get("granularity_embedding.weight");
++        for (int i = 0; i < 512; ++i) {
++            for (int j = 0; j < H; ++j) {
++                out.tokens.row(i)[j] += type.row(i < 8 ? 0 : i < 72 ? 1 : 2)[j] + decor.row(i)[j];
++            }
++        }
++        return out;
++    }
++};
++}  // namespace wepm
