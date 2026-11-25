@@ -2,6 +2,8 @@
 
 This fork runs WePM 1.0 generation, multimodal embeddings and structured decisions in the same llama-server process. Start by building the CLI and native runner from the same checkout. The build fetches the llama.cpp revision in `LLAMA_CPP_VERSION` and applies the patches in `llama/compat`. A separate llama.cpp fork is unnecessary. See the [development guide](../../docs/development.md).
 
+**Status: Linux development preview.** Full CUDA inference for the released 2B Q4_K_M model has an unresolved correctness failure. On the A100 blue-circle regression the GPU language path answers `2.0` while the release reference answers `blue`. The 2B Q4 results below were obtained with CPU language inference, including prefill and decode. They do not qualify the GPU language path. Native Windows and macOS validation is pending.
+
 ## Build on Linux
 
 From the repository root, the following builds a CPU distribution. Install the OpenBLAS and libheif development packages before configuring for accelerated task projections and HEIC input. The corresponding shared libraries must be available on the deployment machine.
@@ -62,7 +64,7 @@ python integration/wepm/parity.py 2B-q4
 
 Use the corresponding label for each model: `2B-q4`, `2B-bf16`, `4B-q4`, `4B-bf16`. Each reference file records the model and reference-code revisions. The fixtures cover plain text, images, a changed question on the same image, interleaved images and all three decision types. A passing run checks input token counts, the answer on each generation case, embedding cosine similarity and normalization, and the top decision and probability error.
 
-The Linux harness can also create all four models, start an isolated server, test CLI and HTTP streaming, cancellation, concurrent requests and runner exit. For CUDA, `--device` selects an NVIDIA GPU index. Extended HEIC and geometry checks use `--models 2B-q4 --media-only --sample-images /path/to/WePocketModel/examples/cpu/demo_data/images` and require Pillow.
+The Linux harness can also create all four models, start an isolated server, test CLI and HTTP streaming, cancellation, concurrent requests and runner exit. For CUDA, `--device` selects an NVIDIA GPU index. The harness checks actual layer placement and fails unless all language layers were offloaded. Use `--allow-2b-q4-cpu-language` only when explicitly testing the 2B Q4 hybrid path. Extended HEIC and geometry checks use `--models 2B-q4 --media-only --sample-images /path/to/WePocketModel/examples/cpu/demo_data/images` and require Pillow.
 
 ```sh
 python integration/wepm/linux_e2e.py dist/bin/ollama dist/lib/ollama \
@@ -72,6 +74,25 @@ python integration/wepm/linux_e2e.py dist/bin/ollama dist/lib/ollama \
 
 ## Validation scope
 
-The four release configurations passed 48 core requests on Linux x86-64 CPU and 48 on NVIDIA A100. CPU matched the reference generation text and token count on 16/16 cases. A100 matched the expected answer on 16/16 and the exact text and length on 14/16. All 12 decisions had the same top choice on each backend. The minimum embedding cosine was 0.9961 on CPU and 0.9974 on A100.
+The four release configurations passed 48 core requests on Linux x86-64 CPU. On the A100 host, 36 requests passed with full language offload (2B BF16 and both 4B profiles), and 12 passed with GPU vision and CPU language (2B Q4_K_M). CPU matched the reference generation text and token count on 16/16 cases. A100 matched the expected answer on 16/16 and the exact text and length on 14/16. All 12 decisions had the same top choice on each backend. The minimum embedding cosine was 0.9961 on CPU and 0.9974 on A100.
 
 For the 2B Q4_K_M profile, the runner keeps the quantized language layers on CPU and can accelerate vision on GPU. Full CUDA language offload gave an incorrect answer to the blue-circle fixture on A100. The other three profiles passed with all language layers on GPU. Native Windows and macOS deployment and Metal numerical parity await device testing.
+
+
+### 2B Q4 full-offload regression
+
+The input to the language model was captured from the release GGUF runtime for
+`shape-0.png` and “Name the color of the circle.” The replay used the same
+529 × 2048 F32 embeddings and the same four position axes on both devices.
+With the released Q4_K_M language file, the first-step logit difference
+`logit(" blue") - logit("2")` was +0.5392 on CPU and −0.3593 with 25/25
+layers offloaded to A100. The respective greedy token IDs were 6105 and 17.
+The embeddings had SHA-256
+`df8e97c06aae3a4b727897a957e91a3f86266e44360aae55f87d1c9e42e78305`.
+
+A diagnostic CUDA K-block matrix multiply using Q8_K activations substantially
+reduced error in the first recurrent input projection on a second fixed
+prefill. Combining it with F32 attention caches recovered the first token on
+that prefill. The corresponding end-to-end run with CUDA vision and all
+25 language layers on A100 still answered `2B40`. The candidate failed the
+acceptance case and is excluded from this branch.
