@@ -11,6 +11,18 @@ index c15959b..a50402f 100644
          self.gguf_writer.add_vision_use_gelu(True)
  
          if self.hparams_vision is not None:
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 2f466e2..6a7be68 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -283,6 +283,7 @@ extern "C" {
+     enum ggml_op_hint {
+         GGML_HINT_NONE             = 0,
+         GGML_HINT_SRC0_IS_HADAMARD = 1,
++        GGML_HINT_SRC1_Q8_K        = 2, // quantize each 256 activation values together for K-block dot products
+     };
+ 
+     // model file types
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 index f984f13..6f783e5 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
@@ -41,6 +53,197 @@ index f984f13..6f783e5 100644
  
  #ifndef NDEBUG
          for (int k = 0; k < nc; k++) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3e1f167..d6521c0 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2532,7 +2532,16 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
+     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, ggml_prec_get_src(up, 1), x_up->ne[1], ncols, nchannels, device);
+ }
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#include "q8-k-activation.cuh"
++#endif
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC1_Q8_K && ggml_cuda_mul_mat_q8_k(ctx, src0, src1, dst)) {
++        return;
++    }
++#endif
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
+@@ -5310,12 +5319,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     return 0;
+ }
+ 
++// Fused CUDA projections use a different activation block layout. Keep the
++// model's language graph on the same unfused schedule for prefill and decode.
++static bool ggml_cuda_graph_uses_q8_k_activations(const ggml_cgraph * graph) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    for (int i = 0; i < graph->n_nodes; ++i) {
++        const ggml_tensor * node = graph->nodes[i];
++        if (node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC1_Q8_K) {
++            return true;
++        }
++    }
++#endif
++    return false;
++}
++
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+     // flag used to determine whether it is an integrated_gpu
+     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+ 
++    const bool use_q8_k_activations = ggml_cuda_graph_uses_q8_k_activations(cgraph);
+     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
+     bool                         is_concurrent_event_active = false;
+     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
+@@ -5466,7 +5490,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
+-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
++                int nodes_to_skip = use_q8_k_activations ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
+ #ifdef GGML_CUDA_DEBUG
+@@ -5649,7 +5673,7 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+-    const bool disable_fusion = ggml_cuda_fusion_disabled();
++    const bool disable_fusion = ggml_cuda_fusion_disabled() || ggml_cuda_graph_uses_q8_k_activations(cgraph);
+ 
+     auto add_alloc_deps = [&](size_t start, size_t last_node) {
+ 
+diff --git a/ggml/src/ggml-cuda/q8-k-activation.cuh b/ggml/src/ggml-cuda/q8-k-activation.cuh
+new file mode 100644
+index 0000000..4709d85
+--- /dev/null
++++ b/ggml/src/ggml-cuda/q8-k-activation.cuh
+@@ -0,0 +1,118 @@
++#pragma once
++
++// Each token has its own symmetric activation scale per 256 input columns.
++// The block sums used by CPU Q8_K kernels are unnecessary here: the Q4_K
++// minimum correction is accumulated by the same warp as the dot product.
++struct cuda_q8_k_activation {
++    float scale;
++    int8_t values[QK_K];
++};
++
++static __global__ void quantize_q8_k_activations(const float * input, cuda_q8_k_activation * output,
++                                                 int blocks, size_t row_stride) {
++    const int column = threadIdx.x;
++    const int block = blockIdx.x;
++    const int token = blockIdx.y;
++    const float value = input[token * row_stride + block * QK_K + column];
++    __shared__ float magnitudes[QK_K];
++    magnitudes[column] = fabsf(value);
++    __syncthreads();
++    for (int stride = QK_K / 2; stride > 0; stride /= 2) {
++        if (column < stride) {
++            magnitudes[column] = fmaxf(magnitudes[column], magnitudes[column + stride]);
++        }
++        __syncthreads();
++    }
++
++    const float inverse_scale = magnitudes[0] == 0.0f ? 0.0f : __fdiv_rn(127.0f, magnitudes[0]);
++    auto & activation = output[token * blocks + block];
++    activation.values[column] = __float2int_rn(value * inverse_scale);
++    if (column == 0) {
++        activation.scale = inverse_scale == 0.0f ? 0.0f : __fdiv_rn(1.0f, inverse_scale);
++    }
++}
++
++static __device__ __forceinline__ int q8_k_warp_sum(int value) {
++    for (int offset = 16; offset > 0; offset /= 2) {
++        value += __shfl_down_sync(0xffffffff, value, offset);
++    }
++    return value;
++}
++
++// One warp owns an output channel and token. Accumulate signed integer
++// products within a block before applying its floating-point scale.
++template <bool is_q4>
++static __global__ void mul_mat_q8_k_activations(const void * weights, const cuda_q8_k_activation * activations,
++                                               float * output, int blocks, int channels) {
++    const int lane = threadIdx.x % 32;
++    const int channel = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
++    const int token = blockIdx.y;
++    if (channel >= channels) {
++        return;
++    }
++
++    float sum = 0.0f;
++    float correction = 0.0f;
++    for (int block = 0; block < blocks; ++block) {
++        const auto & activation = activations[token * blocks + block];
++        int dot = 0;
++        if constexpr (is_q4) {
++            const auto & weight = static_cast<const block_q4_K *>(weights)[channel * blocks + block];
++            int minimum_dot = 0;
++            for (int group = 0; group < 8; ++group) {
++                const uint8_t * scales = weight.scales;
++                const int scale = group < 4 ? scales[group] & 63 :
++                    (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4);
++                const int minimum = group < 4 ? scales[group + 4] & 63 :
++                    (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4);
++                const int nibble = (weight.qs[group / 2 * 32 + lane] >> (4 * (group % 2))) & 15;
++                const int value = activation.values[group * 32 + lane];
++                dot += value * nibble * scale;
++                minimum_dot += value * minimum;
++            }
++            sum = fmaf(q8_k_warp_sum(dot), __low2float(weight.dm) * activation.scale, sum);
++            correction = fmaf(q8_k_warp_sum(minimum_dot), -__high2float(weight.dm) * activation.scale, correction);
++        } else {
++            const auto & weight = static_cast<const block_q6_K *>(weights)[channel * blocks + block];
++            for (int group = 0; group < 8; ++group) {
++                const int quarter = group % 4;
++                const int half = group / 4;
++                const int low = (weight.ql[half * 64 + quarter % 2 * 32 + lane] >> (4 * (quarter / 2))) & 15;
++                const int high = (weight.qh[half * 32 + lane] >> (2 * quarter)) & 3;
++                const int signed_value = (low | (high << 4)) - 32;
++                dot += signed_value * weight.scales[group * 2 + lane / 16] * activation.values[group * 32 + lane];
++            }
++            sum = fmaf(q8_k_warp_sum(dot), __half2float(weight.d) * activation.scale, sum);
++        }
++    }
++    if (lane == 0) {
++        output[token * channels + channel] = sum + correction;
++    }
++}
++
++static bool ggml_cuda_mul_mat_q8_k(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
++                                   const ggml_tensor * input, ggml_tensor * result) {
++    if ((weight->type != GGML_TYPE_Q4_K && weight->type != GGML_TYPE_Q6_K) ||
++            input->type != GGML_TYPE_F32 || result->type != GGML_TYPE_F32 ||
++            !ggml_is_matrix(weight) || !ggml_is_matrix(input) || !ggml_is_contiguous(weight) ||
++            input->nb[0] != sizeof(float) || !ggml_is_contiguous(result) || input->ne[1] > 65535) {
++        return false;
++    }
++    const int blocks = weight->ne[0] / QK_K;
++    const int channels = weight->ne[1];
++    const int tokens = input->ne[1];
++    ggml_cuda_pool_alloc<cuda_q8_k_activation> activations(ctx.pool(), size_t(blocks) * tokens);
++    quantize_q8_k_activations<<<dim3(blocks, tokens), QK_K, 0, ctx.stream()>>>(
++        static_cast<const float *>(input->data), activations.get(), blocks, input->nb[1] / sizeof(float));
++    CUDA_CHECK(cudaGetLastError());
++
++    const dim3 grid((channels + 3) / 4, tokens);
++    auto * output = static_cast<float *>(result->data);
++    if (weight->type == GGML_TYPE_Q4_K) {
++        mul_mat_q8_k_activations<true><<<grid, 128, 0, ctx.stream()>>>(weight->data, activations.get(), output, blocks, channels);
++    } else {
++        mul_mat_q8_k_activations<false><<<grid, 128, 0, ctx.stream()>>>(weight->data, activations.get(), output, blocks, channels);
++    }
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index 3389dcd..19d5fde 100644
 --- a/ggml/src/ggml.c
@@ -71,6 +274,57 @@ index 3389dcd..19d5fde 100644
          case GGML_OP_MUL_MAT:
          case GGML_OP_MUL_MAT_ID:
              if (idx != 1) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 06eb7c9..29fc40b 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1412,6 +1412,11 @@ bool llama_prec_policy::apply(ggml_tensor * res) const {
+ 
+     bool applied = false;
+ 
++    if (!q8_k_activations.empty() && res->op == GGML_OP_MUL_MAT && q8_k_activations.count(res->src[0])) {
++        ggml_mul_mat_set_hint(res, GGML_HINT_SRC1_Q8_K);
++        applied = true;
++    }
++
+     const auto it_acc = prec_acc.find(res->src[0]);
+     if (it_acc != prec_acc.end()) {
+         applied |= ggml_prec_set_acc(res, it_acc->second);
+@@ -1426,6 +1431,21 @@ bool llama_prec_policy::apply(ggml_tensor * res) const {
+ }
+ 
+ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model) {
++    auto profile = ml.kv_overrides.find("wepm.q4_k_m.reference_activations");
++    const bool wepm_2b_q4 = profile != ml.kv_overrides.end() &&
++        profile->second.tag == LLAMA_KV_OVERRIDE_TYPE_BOOL && profile->second.val_bool;
++    if (wepm_2b_q4 && model.arch == LLM_ARCH_QWEN35 && model.hparams.n_layer() == 24 && model.hparams.n_embd == 2048) {
++        // The A100-validated 2B Q4_K_M profile uses Q8_K activations in its first
++        // twelve blocks. Select weight tensors once at load time.
++        for (const auto & [name, weight] : model.tensors_by_name) {
++            unsigned int block;
++            if ((weight->type == GGML_TYPE_Q4_K || weight->type == GGML_TYPE_Q6_K) &&
++                    sscanf(name.c_str(), "blk.%u.", &block) == 1 && block < 12) {
++                q8_k_activations.insert(weight);
++            }
++        }
++    }
++
+     std::vector<std::string> tensor_names;
+     if (!ml.get_arr(LLM_KV_GENERAL_TENSOR_EXTRA_NAME, tensor_names, false)) {
+         return;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index eae5c68..6307dbb 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -743,6 +743,8 @@ struct llama_prec_policy {
+     // the key is the weight tensor `res->src[0]`, stores the recommended activation precision type
+     std::unordered_map<const ggml_tensor *, ggml_prec> prec_src1;
+ 
++    std::unordered_set<const ggml_tensor *> q8_k_activations;
++
+     bool apply(ggml_tensor * res) const;
+ 
+     void set_acc(const ggml_tensor * w, ggml_prec prec) {
 diff --git a/tools/mtmd/models/qwen3vl.cpp b/tools/mtmd/models/qwen3vl.cpp
 index ada7a12..d10ac1f 100644
 --- a/tools/mtmd/models/qwen3vl.cpp
@@ -202,7 +456,7 @@ index 9f9393f..c8a7468 100644
  # llama-server-impl: server logic, reusable by app
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 89f884e..7789aef 100644
+index 89f884e..fa5b45b 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1,39 +1,39 @@
@@ -277,7 +531,7 @@ index 89f884e..7789aef 100644
          spec.reset();
          spec_init.reset();
  
-@@ -1234,6 +1236,20 @@ private:
+@@ -1234,6 +1236,27 @@ private:
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
  
          const bool has_mmproj = !params.mmproj.path.empty();
@@ -285,20 +539,27 @@ index 89f884e..7789aef 100644
 +        if (wepm_profile) {
 +            params_base.n_outputs_max = params_base.n_batch;
 +            params_base.pooling_type  = LLAMA_POOLING_TYPE_NONE;
-+            if (wepm::TensorFile(params.model.path).needs_reference_language_backend()) {
-+                // The released 2B Q4 task-slot model is sensitive to GPU language
-+                // prefill arithmetic. Keep the quantized language path on CPU
-+                // and independently offload the vision tower via mtmd.
-+                params_base.n_gpu_layers  = 0;
-+                params_base.no_kv_offload = true;
-+                params_base.no_op_offload = true;
-+                SRV_INF("%s", "WePM 2B Q4_K_M: using reference CPU language kernels and configured vision device\n");
++            if (wepm::TensorFile(params.model.path).is_2b_q4_k_m()) {
++                auto & overrides = params_base.kv_overrides;
++                llama_model_kv_override profile = { LLAMA_KV_OVERRIDE_TYPE_BOOL, "wepm.q4_k_m.reference_activations", {} };
++                profile.val_bool = true;
++                auto existing = std::find_if(overrides.begin(), overrides.end(), [&](const auto & item) {
++                    return std::strcmp(item.key, profile.key) == 0;
++                });
++                if (existing != overrides.end()) {
++                    *existing = profile;
++                } else {
++                    if (overrides.empty()) {
++                        overrides.emplace_back(); // common_model_params requires a terminating empty key
++                    }
++                    overrides.insert(overrides.end() - 1, profile);
++                }
 +            }
 +        }
          const bool has_draft = params.speculative.has_dft();
          const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                          params_base.speculative.types.end(),
-@@ -1410,6 +1426,10 @@ private:
+@@ -1410,6 +1433,10 @@ private:
                  }
              }
  
@@ -309,7 +570,7 @@ index 89f884e..7789aef 100644
              mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
              if (mctx == nullptr) {
                  SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
-@@ -1417,6 +1437,16 @@ private:
+@@ -1417,6 +1444,16 @@ private:
              }
              SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
  
@@ -326,7 +587,7 @@ index 89f884e..7789aef 100644
              init_opt.video_params.fps_target = params_base.video_fps;
              init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
              init_opt.video_params.ffmpeg_bin_dir = params_base.video_ffmpeg_bin_dir.empty()
-@@ -2949,6 +2979,39 @@ private:
+@@ -2949,6 +2986,39 @@ private:
          }
  
          switch (task.type) {
@@ -366,7 +627,7 @@ index 89f884e..7789aef 100644
              case SERVER_TASK_TYPE_COMPLETION:
              case SERVER_TASK_TYPE_INFILL:
              case SERVER_TASK_TYPE_TRANSCRIBE_RT:
-@@ -2958,6 +3021,10 @@ private:
+@@ -2958,6 +3028,10 @@ private:
              case SERVER_TASK_TYPE_TTS:
              case SERVER_TASK_TYPE_DECISION:
                  {
@@ -377,7 +638,7 @@ index 89f884e..7789aef 100644
                      if (task.need_sampling() && !decision.can_generate()) {
                          send_error(task, "This model is a decision model without text generation, use /v1/systemone", ERROR_TYPE_NOT_SUPPORTED);
                          break;
-@@ -5265,6 +5332,187 @@ void server_context::set_video_decoder(const mtmd_helper_video_decoder * decoder
+@@ -5265,6 +5339,187 @@ void server_context::set_video_decoder(const mtmd_helper_video_decoder * decoder
  // server_routes
  //
  
@@ -565,7 +826,7 @@ index 89f884e..7789aef 100644
  std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
              const server_http_req & req,
              server_task_type type,
-@@ -5958,6 +6206,9 @@ void server_routes::init_routes() {
+@@ -5958,6 +6213,9 @@ void server_routes::init_routes() {
  
      this->post_completions = [this](const server_http_req & req) {
          auto res = create_response();
@@ -575,7 +836,7 @@ index 89f884e..7789aef 100644
          std::vector<raw_buffer> files; // dummy
          const json body = json::parse(req.body);
          return handle_completions_impl(
-@@ -5982,6 +6233,9 @@ void server_routes::init_routes() {
+@@ -5982,6 +6240,9 @@ void server_routes::init_routes() {
  
      this->post_chat_completions = [this](const server_http_req & req) {
          auto res = create_response();
@@ -585,7 +846,7 @@ index 89f884e..7789aef 100644
          std::vector<raw_buffer> files;
          json body = json::parse(req.body);
          common_chat_session session;
-@@ -6474,6 +6728,9 @@ void server_routes::init_routes() {
+@@ -6474,6 +6735,9 @@ void server_routes::init_routes() {
  
      this->post_systemone = [this](const server_http_req & req) {
          auto res = create_response();
@@ -595,7 +856,7 @@ index 89f884e..7789aef 100644
          const auto & decision = ctx_server.decision;
          if (decision.type == COMMON_DECISION_TYPE_NONE) {
              res->error(format_error_response("This model is not a decision model", ERROR_TYPE_NOT_SUPPORTED));
-@@ -6738,6 +6995,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
+@@ -6738,6 +7002,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
  
  std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {
      auto res = create_response();
@@ -880,7 +1141,7 @@ index 0000000..156c054
 +}  // namespace wepm
 diff --git a/tools/server/wepm/engine.hpp b/tools/server/wepm/engine.hpp
 new file mode 100644
-index 0000000..e30c846
+index 0000000..ead2079
 --- /dev/null
 +++ b/tools/server/wepm/engine.hpp
 @@ -0,0 +1,512 @@
@@ -933,7 +1194,7 @@ index 0000000..e30c846
 +        return key >= 0 && gguf_get_kv_type(info.get(), key) == GGUF_TYPE_BOOL && gguf_get_val_bool(info.get(), key);
 +    }
 +
-+    bool needs_reference_language_backend() const {
++    bool is_2b_q4_k_m() const {
 +        const auto * table = ggml_get_tensor(header.get(), "token_embd.weight");
 +        const auto   key   = gguf_find_key(info.get(), "general.file_type");
 +        return table && table->ne[0] == 2048 && key >= 0 && gguf_get_kv_type(info.get(), key) == GGUF_TYPE_UINT32 &&

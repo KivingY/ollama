@@ -297,11 +297,6 @@ def main():
     parser.add_argument("store", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument(
-        "--allow-2b-q4-cpu-language",
-        action="store_true",
-        help="also accept the 2B Q4 compatibility path (GPU vision and all language layers on CPU)",
-    )
     parser.add_argument("--create", action="store_true")
     parser.add_argument(
         "--bundles-root",
@@ -490,7 +485,17 @@ def main():
                         run_log = log_path.read_bytes().split(
                             b'msg="starting llama-server"'
                         )[-1]
-                        assert b"mtmd_backends: using CUDA" in run_log
+                        vision = re.search(
+                            rb"mtmd_backends: using (CUDA\d+) backend", run_log
+                        )
+                        if (
+                            not vision
+                            or b"mmproj graph uses unsupported operators" in run_log
+                        ):
+                            raise AssertionError(
+                                f"{label}: expected all vision operators on CUDA"
+                            )
+                        report[label]["vision_backend"] = vision.group(1).decode("ascii")
                         layers = re.search(
                             rb"offloaded (\d+)/(\d+) layers to GPU", run_log
                         )
@@ -529,20 +534,11 @@ def main():
                     report[label]["unloaded"] = True
                     if args.device != "cpu":
                         offloaded, total = report[label]["gpu_language_layers"]
-                        if total > 0 and offloaded == total:
-                            placement = "full GPU language"
-                        elif (
-                            total > 0
-                            and offloaded == 0
-                            and label == "2B-q4"
-                            and args.allow_2b_q4_cpu_language
-                        ):
-                            placement = "GPU vision, CPU language"
-                        else:
+                        if total <= 0 or offloaded != total:
                             raise AssertionError(
                                 f"{label}: expected full GPU language offload, observed {offloaded}/{total} layers"
                             )
-                        report[label]["validated_placement"] = placement
+                        report[label]["validated_placement"] = "full GPU language"
                     args.output.write_text(
                         json.dumps(report, ensure_ascii=False, indent=2) + "\n"
                     )
