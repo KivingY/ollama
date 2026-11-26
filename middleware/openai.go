@@ -446,6 +446,35 @@ func EmbeddingsMiddleware() gin.HandlerFunc {
 	}
 }
 
+// OrderedChatMessages keeps image and text parts of one OpenAI content
+// array in one turn for native runners that accept interleaved images.
+func OrderedChatMessages(c *gin.Context, messages []api.Message) []api.Message {
+	value, ok := c.Get("openai.content_groups")
+	if !ok {
+		return messages
+	}
+	groups := value.([][2]int)
+	merged := make([]api.Message, 0, len(messages))
+	offset := 0
+	for _, group := range groups {
+		start, end := group[0], group[1]
+		merged = append(merged, messages[offset:start]...)
+		msg := api.Message{Role: messages[start].Role}
+		var text strings.Builder
+		for _, part := range messages[start:end] {
+			text.WriteString(part.Content)
+			for _, image := range part.Images {
+				msg.ImageOffsets = append(msg.ImageOffsets, text.Len())
+				msg.Images = append(msg.Images, image)
+			}
+		}
+		msg.Content = text.String()
+		merged = append(merged, msg)
+		offset = end
+	}
+	return append(merged, messages[offset:]...)
+}
+
 func ChatMiddleware(thinkingLookup ...ThinkingLookup) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req openai.ChatCompletionRequest
@@ -463,7 +492,11 @@ func ChatMiddleware(thinkingLookup ...ThinkingLookup) gin.HandlerFunc {
 		var b bytes.Buffer
 
 		thinking := modelThinking(thinkingLookup, req.Model)
-		chatReq, err := openai.FromChatRequest(req, thinking)
+		var groups [][2]int
+		chatReq, err := openai.FromChatRequestWithGroups(req, &groups, thinking)
+		if len(groups) > 0 {
+			c.Set("openai.content_groups", groups)
+		}
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
 			return

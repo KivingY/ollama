@@ -178,13 +178,14 @@ type MediaData struct {
 }
 
 type Message struct {
-	Role       string
-	Content    string
-	Thinking   string
-	Media      []MediaData
-	ToolCalls  []api.ToolCall
-	ToolName   string
-	ToolCallID string
+	Role         string
+	Content      string
+	Thinking     string
+	Media        []MediaData
+	ImageOffsets []int
+	ToolCalls    []api.ToolCall
+	ToolName     string
+	ToolCallID   string
 }
 
 func MessageFromAPI(msg api.Message) Message {
@@ -194,13 +195,14 @@ func MessageFromAPI(msg api.Message) Message {
 	}
 
 	return Message{
-		Role:       msg.Role,
-		Content:    msg.Content,
-		Thinking:   msg.Thinking,
-		Media:      media,
-		ToolCalls:  msg.ToolCalls,
-		ToolName:   msg.ToolName,
-		ToolCallID: msg.ToolCallID,
+		Role:         msg.Role,
+		Content:      msg.Content,
+		Thinking:     msg.Thinking,
+		Media:        media,
+		ImageOffsets: msg.ImageOffsets,
+		ToolCalls:    msg.ToolCalls,
+		ToolName:     msg.ToolName,
+		ToolCallID:   msg.ToolCallID,
 	}
 }
 
@@ -273,10 +275,7 @@ func (d DoneReason) String() string {
 }
 
 // TokenLogprob represents log probability information for a single token alternative.
-type TokenLogprob struct {
-	Token   string  `json:"token"`
-	Logprob float64 `json:"logprob"`
-}
+type TokenLogprob = api.TokenLogprob
 
 // Logprob contains log probability information for a generated token.
 type Logprob struct {

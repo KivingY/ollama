@@ -1706,6 +1706,7 @@ type llamaServerApplyTemplateResponse struct {
 }
 
 type llamaServerTokenProb struct {
+	Bytes       []int                  `json:"bytes"`
 	Token       string                 `json:"token"`
 	Logprob     float64                `json:"logprob"`
 	Prob        float64                `json:"prob"`
@@ -2011,6 +2012,7 @@ func convertLogprobs(probs []llamaServerTokenProb, includeTop bool) []Logprob {
 		result[i] = Logprob{
 			TokenLogprob: TokenLogprob{
 				Token:   p.Token,
+				Bytes:   p.Bytes,
 				Logprob: logprob,
 			},
 		}
@@ -2031,6 +2033,7 @@ func convertLogprobs(probs []llamaServerTokenProb, includeTop bool) []Logprob {
 			}
 			result[i].TopLogprobs = append(result[i].TopLogprobs, TokenLogprob{
 				Token:   tp.Token,
+				Bytes:   tp.Bytes,
 				Logprob: tl,
 			})
 		}
@@ -2443,19 +2446,31 @@ func llamaServerChatMessage(msg Message) (map[string]any, error) {
 		return converted, nil
 	}
 
-	parts := make([]map[string]any, 0, len(msg.Media)+1)
-	if msg.Content != "" {
-		parts = append(parts, map[string]any{
-			"type": "text",
-			"text": msg.Content,
-		})
+	if msg.ImageOffsets != nil && len(msg.ImageOffsets) != len(msg.Media) {
+		return nil, errors.New("expected one offset per chat attachment")
 	}
-	for _, media := range msg.Media {
+	parts := make([]map[string]any, 0, len(msg.Media)+1)
+	start := 0
+	for i, media := range msg.Media {
+		end := len(msg.Content)
+		if msg.ImageOffsets != nil {
+			end = msg.ImageOffsets[i]
+			if end < start || end > len(msg.Content) {
+				return nil, errors.New("invalid chat attachment offset")
+			}
+		}
+		if start < end {
+			parts = append(parts, map[string]any{"type": "text", "text": msg.Content[start:end]})
+		}
 		part, err := llamaServerChatMediaPart(media)
 		if err != nil {
 			return nil, err
 		}
 		parts = append(parts, part)
+		start = end
+	}
+	if start < len(msg.Content) {
+		parts = append(parts, map[string]any{"type": "text", "text": msg.Content[start:]})
 	}
 	converted["content"] = parts
 	return converted, nil
@@ -2476,7 +2491,7 @@ func llamaServerChatMediaPart(media MediaData) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	mime := http.DetectContentType(data)
+	mime := api.ImageData(data).ContentType()
 	if !strings.HasPrefix(mime, "image/") {
 		mime = "image/jpeg"
 	}
@@ -2554,6 +2569,17 @@ func llamaServerChatResponseFormat(format json.RawMessage) (map[string]any, erro
 }
 
 func (s *llamaServerRunner) Embedding(ctx context.Context, input string, media [][]byte) ([]float32, int, error) {
+	input += strings.Repeat(s.llamaServerMediaMarker(), len(media))
+	return s.embedding(ctx, input, media, nil)
+}
+
+func (s *llamaServerRunner) WePMEmbedding(ctx context.Context, input string, media [][]byte, truncate bool) ([]float32, int, error) {
+	// For a flat image/text pair, match the release reference: image first, then query.
+	input = strings.Repeat(s.llamaServerMediaMarker(), len(media)) + input
+	return s.embedding(ctx, input, media, &truncate)
+}
+
+func (s *llamaServerRunner) embedding(ctx context.Context, input string, media [][]byte, truncate *bool) ([]float32, int, error) {
 	if err := s.sem.Acquire(ctx, 1); err != nil {
 		return nil, 0, err
 	}
@@ -2564,7 +2590,7 @@ func (s *llamaServerRunner) Embedding(ctx context.Context, input string, media [
 		if len(s.launch.projectors) == 0 {
 			return nil, 0, api.StatusError{StatusCode: http.StatusNotImplemented, ErrorMessage: "model does not support media embeddings"}
 		}
-		multimodal := llamaServerMultimodalPrompt{PromptString: input + strings.Repeat(s.llamaServerMediaMarker(), len(media))}
+		multimodal := llamaServerMultimodalPrompt{PromptString: input}
 		for _, m := range media {
 			data, err := llamaServerMediaBytes(m)
 			if err != nil {
@@ -2585,6 +2611,9 @@ func (s *llamaServerRunner) Embedding(ctx context.Context, input string, media [
 	// Use "input" field (not "content") to get the OAI-compatible response format
 	// which includes tokens_evaluated for prompt token counting
 	req := map[string]any{"input": prompt}
+	if truncate != nil {
+		req["truncate"] = *truncate
+	}
 	if s.rawEmbeddings {
 		req["embd_normalize"] = -1
 	}

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"net/http"
 	"os"
 	"reflect"
 	"slices"
@@ -58,6 +59,18 @@ func (e AuthorizationError) Error() string {
 
 // ImageData represents the raw binary data of an image file.
 type ImageData []byte
+
+func (data ImageData) ContentType() string {
+	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
+		switch string(data[8:12]) {
+		case "heic", "heix", "hevc", "hevx":
+			return "image/heic"
+		case "mif1":
+			return "image/heif"
+		}
+	}
+	return http.DetectContentType(data)
+}
 
 // GenerateRequest describes a request sent by [Client.Generate]. While you
 // have to specify the Model and Prompt fields, all the other fields have
@@ -212,6 +225,10 @@ type Message struct {
 	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
 	ToolName   string      `json:"tool_name,omitempty"`
 	ToolCallID string      `json:"tool_call_id,omitempty"`
+
+	// ImageOffsets holds each image's byte position in Content after an ordered
+	// multimodal request has been decoded. A nil slice places images after the text.
+	ImageOffsets []int `json:"-"`
 }
 
 func (m *Message) UnmarshalJSON(b []byte) error {

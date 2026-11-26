@@ -755,12 +755,21 @@ func TestRunChatSpeechModelVoice(t *testing.T) {
 }
 
 func TestRunEmbeddingModel(t *testing.T) {
+	for _, capabilities := range [][]model.Capability{
+		{model.CapabilityEmbedding},
+		{model.CapabilityEmbedding, model.CapabilityCompletion},
+	} {
+		t.Run(fmt.Sprint(capabilities), func(t *testing.T) { testRunEmbeddingModel(t, capabilities) })
+	}
+}
+
+func testRunEmbeddingModel(t *testing.T, capabilities []model.Capability) {
 	reqCh := make(chan api.EmbedRequest, 1)
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/show" && r.Method == http.MethodPost {
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(api.ShowResponse{
-				Capabilities: []model.Capability{model.CapabilityEmbedding},
+				Capabilities: capabilities,
 			}); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 			}

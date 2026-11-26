@@ -620,6 +620,13 @@ func ThinkingFromReasoningEffort(effort string, thinking ...*model.Thinking) (*a
 // FromChatRequest converts a ChatCompletionRequest to api.ChatRequest.
 // An optional thinking descriptor preserves model-defined effort names for rendering.
 func FromChatRequest(r ChatCompletionRequest, thinking ...*model.Thinking) (*api.ChatRequest, error) {
+	return FromChatRequestWithGroups(r, nil, thinking...)
+}
+
+// FromChatRequestWithGroups optionally records which converted messages came
+// from one ordered user content array. Native multimodal models can restore
+// that turn without joining separate user messages.
+func FromChatRequestWithGroups(r ChatCompletionRequest, groups *[][2]int, thinking ...*model.Thinking) (*api.ChatRequest, error) {
 	var messages []api.Message
 	for _, msg := range r.Messages {
 		toolName := ""
@@ -689,6 +696,9 @@ func FromChatRequest(r ChatCompletionRequest, thinking ...*model.Thinking) (*api
 				default:
 					return nil, errors.New("invalid message format")
 				}
+			}
+			if groups != nil && strings.EqualFold(msg.Role, "user") && len(messages) > start+1 && len(msg.ToolCalls) == 0 {
+				*groups = append(*groups, [2]int{start, len(messages)})
 			}
 			// a tool message is a single result, so every message built from it
 			// keeps the tool call it answers. text parts are merged into one

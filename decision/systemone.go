@@ -40,6 +40,9 @@ func ValidateLimits(req Request, decisionType string) error {
 	if len(req.Videos) > 0 {
 		return fmt.Errorf("video inputs are not supported")
 	}
+	if decisionType == "wepm" {
+		return validateWePMRequest(req)
+	}
 	if state, err := Content(req.State); decisionType != "vllm-d3" && err == nil && strings.TrimSpace(state) == "" && len(req.Images) == 0 {
 		return fmt.Errorf("state must not be empty")
 	}

@@ -38,6 +38,25 @@ import (
 	"github.com/ollama/ollama/version"
 )
 
+func TestWePMChatImagePositions(t *testing.T) {
+	images := []api.ImageData{{1}, {2}, {3}}
+	for _, tc := range []struct {
+		text        string
+		offsets     []int
+		wantText    string
+		wantOffsets []int
+	}{
+		{"[img-0]你好[img-1]!", nil, "你好!", []int{0, len("你好"), len("你好!")}},
+		{"ordinary text", nil, "ordinary text", nil},
+		{"literal [img-0]", []int{0, 0, 7}, "literal [img-0]", []int{0, 0, 7}},
+	} {
+		got := wepmChatImagePositions(api.Message{Content: tc.text, Images: images, ImageOffsets: tc.offsets})
+		if got.Content != tc.wantText || !slices.Equal(got.ImageOffsets, tc.wantOffsets) {
+			t.Errorf("%q: got (%q, %v), want (%q, %v)", tc.text, got.Content, got.ImageOffsets, tc.wantText, tc.wantOffsets)
+		}
+	}
+}
+
 func TestGetExistingName(t *testing.T) {
 	t.Setenv("OLLAMA_MODELS", t.TempDir())
 	for _, name := range []string{"MyOrg/MyModel:Q4", "OtherOrg/OtherModel:Q8", "DefaultModel:latest", "localhost:12345/MyOrg/MyModel:Q4"} {

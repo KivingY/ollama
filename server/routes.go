@@ -173,7 +173,7 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 }
 
 func shouldApplyEmbeddingBatchDefault(m *Model, requestOpts map[string]any) bool {
-	if m == nil || hasOption(m.Options, "num_batch") || hasOption(requestOpts, "num_batch") {
+	if m == nil || m.hasWePMProjector() || hasOption(m.Options, "num_batch") || hasOption(requestOpts, "num_batch") {
 		return false
 	}
 	if slices.Contains(m.Config.Capabilities, string(model.CapabilityEmbedding)) {
@@ -898,6 +898,9 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 func (s *Server) systemOneLlamaServer(c *gin.Context, m *Model, req decision.Request, body []byte) {
 	decisionType := m.metadata.String("decision.type")
+	if m.hasWePMProjector() {
+		decisionType = "wepm"
+	}
 	// Old Clef GGUFs have a decision type but use qwen35; llama.cpp now
 	// requires the clef architecture and its converted decision head.
 	oldClef := decisionType == "clef" && m.metadata.String("general.architecture") == "qwen35"
@@ -1217,6 +1220,11 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
+	wepm := m.hasWePMProjector()
+	if wepm && req.Dimensions != 0 && (req.Dimensions < 64 || req.Dimensions > 2048 || req.Dimensions&(req.Dimensions-1) != 0) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "WePM supports dimensions 64, 128, 256, 512, 1024, and 2048"})
+		return
+	}
 	r, m, opts, err := s.scheduleRunnerForModel(c.Request.Context(), m, []model.Capability{}, req.Options, req.KeepAlive, nil)
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
@@ -1290,6 +1298,15 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 	}
 
 	embedWithRetry := func(item embedInput) ([]float32, int, error) {
+		if wepm {
+			runner, ok := r.(interface {
+				WePMEmbedding(context.Context, string, [][]byte, bool) ([]float32, int, error)
+			})
+			if !ok {
+				return nil, 0, api.StatusError{StatusCode: http.StatusBadRequest, ErrorMessage: "runner does not support WePM embeddings"}
+			}
+			return runner.WePMEmbedding(ctx, item.text, item.media, req.Truncate == nil || *req.Truncate)
+		}
 		text := item.text
 		if req.Truncate != nil && !*req.Truncate {
 			tokens, ctxLen, err := inputTokensAndContext(text)
@@ -3278,6 +3295,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		return
 	}
 
+	if m.hasWePMProjector() {
+		req.Messages = middleware.OrderedChatMessages(c, req.Messages)
+	}
 	msgs := chatMessagesForRequest(m, req.Messages)
 
 	parserName := parserNameForModel(m)
@@ -3490,7 +3510,33 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	writeChatResponse(c, req, ch)
 }
 
+// Native WePM prompts can place their attachments with [img-0], [img-1], ...
+// OpenAI content arrays already carry explicit positions and may quote these tags.
+func wepmChatImagePositions(msg api.Message) api.Message {
+	if len(msg.Images) == 0 || msg.ImageOffsets != nil || !strings.Contains(msg.Content, "[img-0]") {
+		return msg
+	}
+
+	var text strings.Builder
+	remaining := msg.Content
+	for i := range msg.Images {
+		before, after, _ := strings.Cut(remaining, fmt.Sprintf("[img-%d]", i))
+		text.WriteString(before)
+		msg.ImageOffsets = append(msg.ImageOffsets, text.Len())
+		remaining = after
+	}
+	text.WriteString(remaining)
+	msg.Content = text.String()
+	return msg
+}
+
 func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, opts *api.Options, nativeReq llm.ChatRequest, truncate bool) (llm.ChatRequest, error) {
+	if m != nil && m.hasWePMProjector() {
+		nativeReq.Messages = slices.Clone(nativeReq.Messages)
+		for i, msg := range nativeReq.Messages {
+			nativeReq.Messages[i] = wepmChatImagePositions(msg)
+		}
+	}
 	var err error
 	nativeReq.Messages, err = truncateNativeChatMessages(ctx, m, r, optionsForPrompt(opts, r), nativeReq, truncate)
 	return nativeReq, err

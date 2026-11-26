@@ -828,6 +828,37 @@ func TestChatWriter_StreamEmptyCompletionStillEmitsRoleChunk(t *testing.T) {
 	}
 }
 
+func TestChatMiddlewareOrderedUserTurns(t *testing.T) {
+	router := gin.New()
+	var got []api.Message
+	router.POST("/", ChatMiddleware(), func(c *gin.Context) {
+		var req api.ChatRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			t.Fatal(err)
+		}
+		got = OrderedChatMessages(c, req.Messages)
+	})
+	body := `{"model":"wepm","messages":[
+		{"role":"user","content":[{"type":"text","text":"图 [img-0]"},{"type":"image_url","image_url":"data:image/png;base64,AQ=="},{"type":"text","text":" [img-1] "},{"type":"image_url","image_url":"data:image/png;base64,Ag=="}]},
+		{"role":"user","content":[{"type":"image_url","image_url":"data:image/png;base64,Aw=="},{"type":"text","text":"next"}]},
+		{"role":"user","content":[{"type":"text","text":"one "},{"type":"text","text":"turn"}]},
+		{"role":"assistant","content":"reply"}]}`
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	want := []api.Message{
+		{Role: "user", Content: "图 [img-0] [img-1] ", Images: []api.ImageData{{1}, {2}}, ImageOffsets: []int{len("图 [img-0]"), len("图 [img-0] [img-1] ")}},
+		{Role: "user", Content: "next", Images: []api.ImageData{{3}}, ImageOffsets: []int{0}},
+		{Role: "user", Content: "one turn"},
+		{Role: "assistant", Content: "reply"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ordered messages: got %#v, want %#v", got, want)
+	}
+}
+
 func TestChatMiddleware(t *testing.T) {
 	type testCase struct {
 		name string

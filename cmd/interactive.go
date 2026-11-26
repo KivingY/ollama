@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,7 +46,11 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		fmt.Fprintln(os.Stderr, "Use \"\"\" to begin a multi-line message.")
 
 		if opts.MultiModal {
-			fmt.Fprintf(os.Stderr, "Use %s to include .jpg, .png, .webp images, or .wav audio files.\n", filepath.FromSlash("/path/to/file"))
+			if opts.WePM {
+				fmt.Fprintf(os.Stderr, "Use %s to include .jpg, .png, .webp, .heic or .heif images.\n", filepath.FromSlash("/path/to/file"))
+			} else {
+				fmt.Fprintf(os.Stderr, "Use %s to include .jpg, .png, .webp images, or .wav audio files.\n", filepath.FromSlash("/path/to/file"))
+			}
 		}
 
 		fmt.Fprintln(os.Stderr, "")
@@ -249,7 +252,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				return err
 			}
 			applyShowResponseToRunOptions(&opts, info)
-			opts.Decision = slices.Contains(info.Capabilities, model.CapabilityDecision)
+			opts.Decision = slices.Contains(info.Capabilities, model.CapabilityDecision) && !opts.WePM
 			decisionState = nil
 			if opts.Decision {
 				// Decision models can't generate; the first answer loads the model.
@@ -654,7 +657,7 @@ func extractFileNames(input string) []string {
 	// Regex to match file paths starting with optional drive letter, / ./ \ or .\ and include escaped or unescaped spaces (\ or %20)
 	// and followed by more characters and a file extension
 	// This will capture non filename strings, but we'll check for file existence to remove mismatches
-	regexPattern := `(?:[a-zA-Z]:)?(?:\./|/|\\)[\S\\ ]+?\.(?i:jpg|jpeg|png|webp|wav)\b`
+	regexPattern := `(?:[a-zA-Z]:)?(?:\./|/|\\)[\S\\ ]+?\.(?i:jpg|jpeg|png|webp|heic|heif|wav)\b`
 	re := regexp.MustCompile(regexPattern)
 
 	return re.FindAllString(input, -1)
@@ -754,8 +757,8 @@ func getImageData(filePath string) ([]byte, error) {
 		return nil, err
 	}
 
-	contentType := http.DetectContentType(buf)
-	allowedTypes := []string{"image/jpeg", "image/jpg", "image/png", "image/webp", "audio/wave"}
+	contentType := api.ImageData(buf).ContentType()
+	allowedTypes := []string{"image/jpeg", "image/jpg", "image/png", "image/webp", "image/heic", "image/heif", "audio/wave"}
 	if !slices.Contains(allowedTypes, contentType) {
 		return nil, fmt.Errorf("invalid file type: %s", contentType)
 	}

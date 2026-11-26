@@ -172,7 +172,7 @@ func (m *Model) Capabilities() []model.Capability {
 // model. Serving still uses Capabilities.
 func (m *Model) publicCapabilities() []model.Capability {
 	capabilities := m.Capabilities()
-	if slices.Contains(capabilities, model.CapabilityDecision) {
+	if !m.hasWePMProjector() && slices.Contains(capabilities, model.CapabilityDecision) {
 		public := []model.Capability{model.CapabilityDecision}
 		if slices.Contains(m.Config.Capabilities, "vision") || len(m.ProjectorPaths) > 0 {
 			public = append(public, model.CapabilityVision)
@@ -440,6 +440,10 @@ func logTemplateSelection(m *Model) {
 	)
 }
 
+func (m *Model) hasWePMProjector() bool {
+	return slices.ContainsFunc(m.projectorMetadata, func(md ggufMetadata) bool { return md.Bool("wepm.task_heads") })
+}
+
 func (m *Model) projectorCapabilities(capabilities []model.Capability) []model.Capability {
 	if len(m.ProjectorPaths) == 0 {
 		return capabilities
@@ -450,6 +454,10 @@ func (m *Model) projectorCapabilities(capabilities []model.Capability) []model.C
 	audioOnly := len(m.projectorMetadata) == len(m.ProjectorPaths) && !slices.ContainsFunc(m.projectorMetadata, func(md ggufMetadata) bool {
 		return !projectorHasAudio(md) || projectorHasVision(md)
 	})
+	if m.hasWePMProjector() {
+		capabilities = appendCapability(capabilities, model.CapabilityEmbedding)
+		capabilities = appendCapability(capabilities, model.CapabilityDecision)
+	}
 	if !audioOnly {
 		capabilities = appendCapability(capabilities, model.CapabilityVision)
 	}
@@ -509,6 +517,9 @@ func (m *Model) modelFamilyCapabilities(capabilities []model.Capability) []model
 }
 
 func (m *Model) filterUnsupportedCapabilities(capabilities []model.Capability, modelArch string) []model.Capability {
+	if m.hasWePMProjector() {
+		return []model.Capability{model.CapabilityCompletion, model.CapabilityVision, model.CapabilityEmbedding, model.CapabilityDecision}
+	}
 	if m.metadata.String("decision.type") != "" {
 		capabilities = slices.DeleteFunc(capabilities, func(c model.Capability) bool {
 			return c == model.CapabilityCompletion || c == model.CapabilityInsert ||

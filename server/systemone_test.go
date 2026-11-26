@@ -548,3 +548,37 @@ func TestSystemOneHandlerCloudPassthrough(t *testing.T) {
 		t.Fatalf("expected one answer, got %s", string(body))
 	}
 }
+
+func TestSystemOneWePMScoreLevels(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	writeShowManifestVariant(t, "wepm-test", manifest.RunnerLlamaCPP, manifest.FormatGGUF,
+		model.ConfigV2{ModelFormat: manifest.FormatGGUF},
+		map[string]any{"general.architecture": "qwen35", "qwen35.decision.type": "wepm"})
+	runner := &systemOneTestRunner{}
+	s := newServerWithMockRunner(t, &runner.mockRunner)
+	s.sched.loadFn = func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+		req.successCh <- &runnerRef{llama: runner}
+		return false
+	}
+	for _, tt := range []struct {
+		count, status int
+	}{{11, http.StatusOK}, {255, http.StatusOK}, {256, http.StatusBadRequest}} {
+		levels := make([]string, tt.count)
+		for i := range levels {
+			levels[i] = fmt.Sprint(i)
+		}
+		w := createRequest(t, s.SystemOneHandler, map[string]any{
+			"model": "wepm-test", "state": nil,
+			"questions": map[string]any{"q": map[string]any{
+				"type": "score", "instructions": "Rate the clarity.", "criteria": levels,
+			}},
+		})
+		if w.Code != tt.status {
+			t.Fatalf("%d levels: status=%d body=%s", tt.count, w.Code, w.Body)
+		}
+	}
+	if runner.calls != 2 || !runner.native {
+		t.Fatalf("expected two accepted requests on the native runner, got %d", runner.calls)
+	}
+}

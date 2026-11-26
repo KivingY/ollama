@@ -9,25 +9,24 @@ import (
 func toAPILogprobs(logprobs []llm.Logprob) []api.Logprob {
 	result := make([]api.Logprob, len(logprobs))
 	for i, lp := range logprobs {
-		result[i] = api.Logprob{
-			TokenLogprob: api.TokenLogprob{
-				Token:   lp.Token,
-				Bytes:   stringToByteInts(lp.Token),
-				Logprob: lp.Logprob,
-			},
-		}
+		result[i].TokenLogprob = withTokenBytes(lp.TokenLogprob)
 		if len(lp.TopLogprobs) > 0 {
 			result[i].TopLogprobs = make([]api.TokenLogprob, len(lp.TopLogprobs))
 			for j, tlp := range lp.TopLogprobs {
-				result[i].TopLogprobs[j] = api.TokenLogprob{
-					Token:   tlp.Token,
-					Bytes:   stringToByteInts(tlp.Token),
-					Logprob: tlp.Logprob,
-				}
+				result[i].TopLogprobs[j] = withTokenBytes(tlp)
 			}
 		}
 	}
 	return result
+}
+
+// Some runners supply text only. Preserve raw bytes when the runner provides them,
+// including for tokens that end in the middle of a UTF-8 sequence.
+func withTokenBytes(token api.TokenLogprob) api.TokenLogprob {
+	if token.Bytes == nil {
+		token.Bytes = stringToByteInts(token.Token)
+	}
+	return token
 }
 
 func stringToByteInts(s string) []int {

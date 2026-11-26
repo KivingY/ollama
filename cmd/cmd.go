@@ -976,7 +976,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 	opts.Prompt = strings.Join(prompts, " ")
 
-	if slices.Contains(info.Capabilities, model.CapabilityDecision) {
+	if slices.Contains(info.Capabilities, model.CapabilityDecision) && (!opts.WePM || cmd.Flags().Changed("ask")) {
 		return runDecision(cmd, opts, interactive)
 	}
 	if cmd.Flags().Changed("ask") {
@@ -990,7 +990,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	isEmbeddingModel := slices.Contains(info.Capabilities, model.CapabilityEmbedding)
 
 	// If it's an embedding model, handle embedding generation
-	if isEmbeddingModel {
+	if isEmbeddingModel && (!opts.WePM || cmd.Flags().Changed("dimensions") || cmd.Flags().Changed("truncate")) {
 		if opts.Prompt == "" {
 			return errors.New("embedding models require input text. Usage: ollama run " + name + " \"your text here\"")
 		}
@@ -1859,6 +1859,7 @@ type runOptions struct {
 	HideThinking   bool
 	ShowConnect    bool
 	Decision       bool
+	WePM           bool
 	Questions      *api.SystemOneQuestions
 }
 
@@ -1913,11 +1914,13 @@ func (r runOptions) Copy() runOptions {
 		HideThinking:   r.HideThinking,
 		ShowConnect:    r.ShowConnect,
 		Decision:       r.Decision,
+		WePM:           r.WePM,
 		Questions:      r.Questions,
 	}
 }
 
 func applyShowResponseToRunOptions(opts *runOptions, info *api.ShowResponse) {
+	opts.WePM, _ = info.ProjectorInfo["clip.wepm.task_heads"].(bool)
 	opts.ParentModel = info.Details.ParentModel
 	opts.LoadedMessages = slices.Clone(info.Messages)
 	opts.MultiModal = slices.Contains(info.Capabilities, model.CapabilityVision) ||

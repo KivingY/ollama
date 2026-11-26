@@ -24,7 +24,7 @@ func (s *llamaServerRunner) SystemOne(ctx context.Context, state, questions json
 		if err != nil {
 			return nil, nil, api.StatusError{StatusCode: http.StatusBadRequest, ErrorMessage: err.Error()}
 		}
-		request.Images = append(request.Images, "data:"+http.DetectContentType(data)+";base64,"+base64.StdEncoding.EncodeToString(data))
+		request.Images = append(request.Images, "data:"+api.ImageData(data).ContentType()+";base64,"+base64.StdEncoding.EncodeToString(data))
 	}
 	data, err := json.Marshal(request)
 	if err != nil {

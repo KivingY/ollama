@@ -1807,6 +1807,50 @@ func TestLegacyEmbeddingsWereRaw(t *testing.T) {
 	}
 }
 
+func TestWePMEmbeddingImageBeforeText(t *testing.T) {
+	type embedRequest struct {
+		Input    llamaServerMultimodalPrompt
+		Truncate *bool
+	}
+	requests := make(chan embedRequest, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			fmt.Fprint(w, `{"status":"ok"}`)
+			return
+		}
+		var request embedRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode embedding request: %v", err)
+		}
+		requests <- request
+		fmt.Fprint(w, `{"data":[{"embedding":[1],"tokens_evaluated":2}]}`)
+	}))
+	defer srv.Close()
+	runner := &llamaServerRunner{
+		port:        srv.Listener.Addr().(*net.TCPAddr).Port,
+		cmd:         fakeRunningCmd(),
+		sem:         semaphore.NewWeighted(1),
+		launch:      llamaServerLaunchConfig{projectors: []string{"vision.gguf"}},
+		mediaMarker: "<image>",
+	}
+	media := [][]byte{{1, 2, 3}}
+	if _, _, err := runner.WePMEmbedding(t.Context(), "query", media, false); err != nil {
+		t.Fatal(err)
+	}
+	request := <-requests
+	if request.Input.PromptString != "<image>query" || !slices.Equal(request.Input.MultimodalData, []string{"AQID"}) ||
+		request.Truncate == nil || *request.Truncate {
+		t.Fatalf("unexpected WePM request: %+v", request)
+	}
+	if _, _, err := runner.Embedding(t.Context(), "query", media); err != nil {
+		t.Fatal(err)
+	}
+	request = <-requests
+	if request.Input.PromptString != "query<image>" || request.Truncate != nil {
+		t.Fatalf("unexpected default request: %+v", request)
+	}
+}
+
 func TestLlamaServerEmbeddingFallbackFormat(t *testing.T) {
 	// Fallback: non-OAI array format (from "content" field)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3885,6 +3929,28 @@ func TestLlamaServerChatMessageConvertsToolCalls(t *testing.T) {
 	}
 }
 
+func TestLlamaServerChatOrderedImages(t *testing.T) {
+	const first = "图 [img-0] "
+	const last = " [img-1]"
+	png := api.ImageData("\x89PNG\r\n\x1a\n")
+	images := []api.ImageData{append(slices.Clone(png), 1), append(slices.Clone(png), 2)}
+	msg := api.Message{Role: "user", Content: first + last, Images: images, ImageOffsets: []int{len(first), len(first)}}
+	converted, err := llamaServerChatMessage(MessageFromAPI(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := converted["content"].([]map[string]any)
+	if len(parts) != 4 || parts[0]["text"] != first || parts[3]["text"] != last {
+		t.Fatalf("unexpected content parts: %#v", parts)
+	}
+	for i, img := range images {
+		url := parts[i+1]["image_url"].(map[string]any)["url"]
+		if want := "data:image/png;base64," + base64.StdEncoding.EncodeToString(img); url != want {
+			t.Fatalf("image %d: got %v, want %s", i, url, want)
+		}
+	}
+}
+
 func TestLlamaServerChatMessageConvertsMediaParts(t *testing.T) {
 	png := []byte("\x89PNG\r\n\x1a\n")
 	webp, err := base64.StdEncoding.DecodeString("UklGRhwAAABXRUJQVlA4TA8AAAAvAAAAAAcQ/Y/+ByKi/wEA")
@@ -3896,7 +3962,7 @@ func TestLlamaServerChatMessageConvertsMediaParts(t *testing.T) {
 
 	msg, err := llamaServerChatMessage(Message{
 		Role:    "user",
-		Content: "describe these",
+		Content: "describe [img-0] and these",
 		Media:   []MediaData{NewMediaData(0, png), NewMediaData(1, webp), NewMediaData(2, wav), NewMediaData(3, mp3)},
 	})
 	if err != nil {
@@ -3906,6 +3972,9 @@ func TestLlamaServerChatMessageConvertsMediaParts(t *testing.T) {
 	parts, ok := msg["content"].([]map[string]any)
 	if !ok || len(parts) != 5 {
 		t.Fatalf("expected five content parts, got %#v", msg["content"])
+	}
+	if parts[0]["text"] != "describe [img-0] and these" {
+		t.Fatalf("literal image tag changed: %#v", parts[0])
 	}
 	if parts[1]["type"] != "image_url" {
 		t.Fatalf("expected image_url for PNG, got %#v", parts[1])
